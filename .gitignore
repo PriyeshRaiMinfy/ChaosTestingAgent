@@ -216,3 +216,26 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── BreakBot project-specific ────────────────────────────────────────────
+
+# Scan outputs — contain real AWS account data (ARNs, IPs, IAM policies).
+# NEVER commit these. They may include sensitive resource metadata.
+scans/
+**/scans/
+
+# Generated graph artifacts (output of `breakbot graph`)
+graph.html
+attack_surface.txt
+report.md
+
+# AWS credentials — extra safety net (never commit these)
+.aws/
+aws_credentials
+credentials
+
+# Claude Code IDE session data (personal, machine-specific)
+.claude/
+
+# uv lock file is committed intentionally for reproducibility (application, not library)
+# uv.lock — do NOT add this line; we want uv.lock tracked

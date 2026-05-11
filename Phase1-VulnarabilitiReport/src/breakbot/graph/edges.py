@@ -1,0 +1,29 @@
+"""
+Edge type definitions for the BreakBot dependency graph.
+
+Every edge in the graph has an `edge_type` attribute set to one of these values.
+The LLM serializer uses these labels to reason about what traversal means.
+"""
+from __future__ import annotations
+
+from enum import Enum
+
+
+class EdgeType(str, Enum):
+    # IAM / identity edges
+    IAM_CAN_ASSUME = "iam_can_assume"
+    IAM_CAN_ACCESS = "iam_can_access"
+    HAS_EXECUTION_ROLE = "has_execution_role"
+    HAS_INSTANCE_PROFILE = "has_instance_profile"
+
+    # Network edges
+    NETWORK_CAN_REACH = "network_can_reach"
+    INTERNET_EXPOSES = "internet_exposes"
+    ATTACHED_TO_SG = "attached_to_sg"
+
+    # Structural / membership edges
+    IN_VPC = "in_vpc"
+
+
+# Synthetic node IDs — not real AWS ARNs, but useful anchors in the graph.
+INTERNET_NODE_ID = "INTERNET"

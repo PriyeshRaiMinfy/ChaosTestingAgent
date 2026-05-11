@@ -32,6 +32,12 @@ class IdentityScanner(BaseScanner):
     domain = "identity"
     is_global = True  # IAM is global — scan once
 
+    def __init__(self, session):
+        super().__init__(session)
+        # Policy document cache keyed by policy ARN — avoids refetching the
+        # same AWS-managed policy when it's attached to hundreds of roles.
+        self._policy_doc_cache: dict[str, dict | None] = {}
+
     def _scan_region(self, region: str) -> list[Resource]:
         resources: list[Resource] = []
         resources.extend(self._scan_roles())
@@ -80,12 +86,18 @@ class IdentityScanner(BaseScanner):
         if isinstance(trust_policy, str):
             trust_policy = json.loads(unquote(trust_policy))
 
-        # Attached managed policies
+        # Attached managed policies — fetch each policy's default version document
+        # so the graph builder can construct iam_can_access edges without extra calls.
         attached = iam.list_attached_role_policies(RoleName=role_name)
-        managed_policies = [
-            {"name": p["PolicyName"], "arn": p["PolicyArn"]}
-            for p in attached.get("AttachedPolicies", [])
-        ]
+        managed_policies = []
+        for p in attached.get("AttachedPolicies", []):
+            doc = self._get_policy_document(p["PolicyArn"])
+            managed_policies.append({
+                "name": p["PolicyName"],
+                "arn": p["PolicyArn"],
+                "is_aws_managed": p["PolicyArn"].startswith("arn:aws:iam::aws:"),
+                "document": doc,
+            })
 
         # Inline policies — fetch each document
         inline_names = iam.list_role_policies(RoleName=role_name).get("PolicyNames", [])
@@ -116,6 +128,35 @@ class IdentityScanner(BaseScanner):
             account_id=self.session.account_id,
             properties=properties,
         )
+
+    # ──────────────────────── Policy Documents ───────────────────────────
+
+    def _get_policy_document(self, policy_arn: str) -> dict | None:
+        """
+        Fetches the default policy version document for a managed policy.
+        Results are cached so the same AWS-managed policy attached to 50 roles
+        only causes one API call.
+        """
+        if policy_arn in self._policy_doc_cache:
+            return self._policy_doc_cache[policy_arn]
+
+        iam = self.session.client("iam", region="us-east-1")
+        try:
+            policy_meta = iam.get_policy(PolicyArn=policy_arn)
+            version_id = policy_meta["Policy"]["DefaultVersionId"]
+            version = iam.get_policy_version(PolicyArn=policy_arn, VersionId=version_id)
+            doc = version["PolicyVersion"]["Document"]
+            if isinstance(doc, str):
+                doc = json.loads(unquote(doc))
+            self._policy_doc_cache[policy_arn] = doc
+        except ClientError as e:
+            logger.warning(
+                "Could not fetch policy document %s: %s",
+                policy_arn, e.response["Error"]["Code"],
+            )
+            self._policy_doc_cache[policy_arn] = None
+
+        return self._policy_doc_cache[policy_arn]
 
     # ──────────────────────────── Users ─────────────────────────────────
 
