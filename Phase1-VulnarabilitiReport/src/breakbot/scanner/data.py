@@ -28,10 +28,15 @@ class DataScanner(BaseScanner):
     domain = "data"
     is_global = False  # RDS is regional. S3 is handled specially below.
 
+    def __init__(self, session):
+        super().__init__(session)
+        self._s3_scanned = False
+
     def _scan_region(self, region: str) -> list[Resource]:
         resources: list[Resource] = []
-        # S3 is global — only scan it once on the first region pass
-        if region == self.session.enabled_regions()[0]:
+        # S3 is global — scan it exactly once regardless of which regions are targeted
+        if not self._s3_scanned:
+            self._s3_scanned = True
             resources.extend(self._scan_s3())
         resources.extend(self._scan_rds(region))
         return resources

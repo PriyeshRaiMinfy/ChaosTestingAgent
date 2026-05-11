@@ -22,6 +22,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
+from breakbot.graph import GraphBuilder, GraphSerializer
 from breakbot.models import ScanResult
 from breakbot.scanner import (
     ComputeScanner,
@@ -174,6 +175,60 @@ def validate(
             console.print("[green]✔[/green] Write access correctly denied — profile is read-only")
         else:
             console.print(f"[yellow]?[/yellow] Unexpected error on write test: {e}")
+
+
+@app.command()
+def graph(
+    scan_dir: Path = typer.Argument(..., help="Path to a scan output directory (e.g. scans/scan-...)"),
+    html: Path = typer.Option(None, "--html", help="Save interactive HTML visualization to this path"),
+    serialize: Path = typer.Option(None, "--serialize", "-s", help="Save LLM-ready text to this path"),
+    max_hops: int = typer.Option(5, "--max-hops", help="Max path length when searching entry → sink"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Build the dependency graph from a completed scan and optionally visualize or serialize it."""
+    _configure_logging(verbose)
+
+    scan_file = scan_dir / "scan.json"
+    if not scan_file.exists():
+        console.print(f"[red]No scan.json found in {scan_dir}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"Loading scan from [bold]{scan_file}[/bold]")
+    result = ScanResult.model_validate_json(scan_file.read_text())
+    console.print(
+        f"Loaded {result.resource_count} resources from account [yellow]{result.account_id}[/yellow]"
+    )
+
+    console.print("[bold]Building dependency graph...[/bold]")
+    builder = GraphBuilder(result)
+    g = builder.build()
+
+    serializer = GraphSerializer(g, builder.arn_index, max_hops=max_hops)
+    stats = serializer.stats()
+
+    table = Table(title="Graph summary")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Count", justify="right", style="green")
+    for k, v in stats.items():
+        table.add_row(k.replace("_", " ").title(), str(v))
+    console.print(table)
+
+    if html:
+        try:
+            from breakbot.graph.visualize import render_html
+            console.print(f"Rendering HTML to [bold]{html}[/bold]")
+            render_html(g, html)
+            console.print(f"[green]✔[/green] Visualization saved to {html}")
+        except ImportError as e:
+            console.print(f"[yellow]Skipping HTML output:[/yellow] {e}")
+
+    if serialize:
+        console.print(f"Serializing graph for LLM to [bold]{serialize}[/bold]")
+        serializer.save(serialize)
+        console.print(f"[green]✔[/green] Serialization saved to {serialize}")
+
+    if not html and not serialize:
+        console.print("\n[dim]Tip: use --html graph.html or --serialize attack_surface.txt[/dim]")
 
 
 if __name__ == "__main__":

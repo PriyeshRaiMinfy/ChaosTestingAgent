@@ -13,9 +13,7 @@ large accounts. We override with adaptive mode + higher max attempts.
 from __future__ import annotations
 
 import logging
-from functools import lru_cache
 
-import boto3
 from boto3.session import Session
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -47,6 +45,7 @@ class AWSSession:
         self._default_region = region
         self._client_cache: dict[tuple[str, str], object] = {}
         self._account_id: str | None = None
+        self._regions_cache: list[str] | None = None
 
     @property
     def account_id(self) -> str:
@@ -71,19 +70,21 @@ class AWSSession:
             )
         return self._client_cache[key]
 
-    @lru_cache(maxsize=1)
     def enabled_regions(self) -> list[str]:
         """
         Returns all regions enabled for this account.
-        Cached because it's slow and never changes mid-scan.
+        Cached on the instance — never changes mid-scan.
         """
+        if self._regions_cache is not None:
+            return self._regions_cache
+
         ec2 = self.client("ec2", region=self._default_region)
         try:
             response = ec2.describe_regions(AllRegions=False)
-            regions = sorted(r["RegionName"] for r in response["Regions"])
-            logger.info("Discovered %d enabled regions", len(regions))
-            return regions
+            self._regions_cache = sorted(r["RegionName"] for r in response["Regions"])
+            logger.info("Discovered %d enabled regions", len(self._regions_cache))
         except ClientError as e:
             logger.error("Failed to enumerate regions: %s", e)
-            # Fallback to the default region only — scan can still proceed
-            return [self._default_region]
+            self._regions_cache = [self._default_region]
+
+        return self._regions_cache
