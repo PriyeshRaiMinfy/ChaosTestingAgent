@@ -34,33 +34,38 @@ BreakBot builds the chain.
 
 ## Project Layout
 
-```
+<pre>
 Phase1-VulnarabilitiReport/
 │
-├── pyproject.toml                   package config, deps, CLI entry point
-├── uv.lock                          locked dependency versions
+├── <a href="pyproject.toml">pyproject.toml</a>                   package config, deps, CLI entry point
+├── <a href="uv.lock">uv.lock</a>                          locked dependency versions
 │
 └── src/breakbot/
-    ├── models/                      Pydantic data contracts
-    ├── utils/                       shared AWS session infrastructure
-    ├── scanner/                     Phase 2 — AWS resource discovery
-    ├── graph/                       Phase 4 — dependency graph + serializer
-    ├── brain/                       Phase 5 — LLM reasoning  [TBD]
-    └── cli/                         CLI commands (scan, graph, validate)
-```
-
-### Module index
-
-| Module | Phase | What it does | Docs |
-|---|:---:|---|---|
-| [`src/breakbot/scanner/`](src/breakbot/scanner/) | 2 | Discovers EC2, Lambda, IAM, S3, RDS, VPC, SGs across all regions | [README →](src/breakbot/scanner/README.md) |
-| [`src/breakbot/graph/`](src/breakbot/graph/) | 4 | Builds networkx dependency graph, infers 8 edge types, serializes for LLM | [README →](src/breakbot/graph/README.md) |
-| [`src/breakbot/cli/`](src/breakbot/cli/) | 1–5 | `breakbot scan`, `breakbot graph`, `breakbot validate` | [README →](src/breakbot/cli/README.md) |
-| [`src/breakbot/models/`](src/breakbot/models/) | — | `Resource`, `ResourceType`, `ScanResult` — shared data contracts | [README →](src/breakbot/models/README.md) |
-| [`src/breakbot/utils/`](src/breakbot/utils/) | — | Boto3 session, client caching, adaptive retry config | [README →](src/breakbot/utils/README.md) |
-| [`src/breakbot/brain/`](src/breakbot/brain/) | 5 | Claude API prompt pipeline — attack path reasoning | TBD |
-| [`tests/unit/`](tests/unit/) | — | Moto-mocked unit tests — no real AWS calls | — |
-| [`tests/integration/`](tests/integration/) | — | Real AWS integration tests (opt-in, needs creds) | — |
+    │
+    ├── <a href="src/breakbot/models/"><b>models/</b></a>          ← Pydantic data contracts  (<a href="src/breakbot/models/README.md">README</a>)
+    │   └── resource.py          Resource · ResourceType · ScanResult
+    │
+    ├── <a href="src/breakbot/utils/"><b>utils/</b></a>           ← shared AWS session infrastructure  (<a href="src/breakbot/utils/README.md">README</a>)
+    │   └── aws_session.py       boto3 session · client cache · retry config
+    │
+    ├── <a href="src/breakbot/scanner/"><b>scanner/</b></a>         ← Phase 2 — AWS resource discovery  (<a href="src/breakbot/scanner/README.md">README</a>)
+    │   ├── base.py              abstract base — multi-region orchestration
+    │   ├── compute.py           EC2 instances · Lambda functions
+    │   ├── networking.py        VPCs · subnets · security groups · ALBs
+    │   ├── data.py              S3 buckets · RDS instances
+    │   └── identity.py          IAM roles · users · policy documents
+    │
+    ├── <a href="src/breakbot/graph/"><b>graph/</b></a>           ← Phase 4 — dependency graph + serializer  (<a href="src/breakbot/graph/README.md">README</a>)
+    │   ├── edges.py             EdgeType enum · INTERNET virtual node
+    │   ├── builder.py           GraphBuilder — infers 8 edge types from scan
+    │   ├── serializer.py        GraphSerializer — compact LLM-ready text
+    │   └── visualize.py         pyvis HTML renderer
+    │
+    ├── <a href="src/breakbot/brain/"><b>brain/</b></a>           ← Phase 5 — LLM reasoning  [TBD]
+    │
+    └── <a href="src/breakbot/cli/"><b>cli/</b></a>             ← CLI entry points  (<a href="src/breakbot/cli/README.md">README</a>)
+        └── main.py              breakbot scan · breakbot graph · breakbot validate
+</pre>
 
 ---
 
