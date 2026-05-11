@@ -32,6 +32,43 @@ BreakBot builds the chain.
 
 ---
 
+## Project Layout
+
+<pre>
+Phase1-VulnarabilitiReport/
+│
+├── <a href="pyproject.toml">pyproject.toml</a>                   package config, deps, CLI entry point
+├── <a href="uv.lock">uv.lock</a>                          locked dependency versions
+│
+└── src/breakbot/
+    │
+    ├── <a href="src/breakbot/models/"><b>models/</b></a>          ← Pydantic data contracts  (<a href="src/breakbot/models/README.md">README</a>)
+    │   └── resource.py          Resource · ResourceType · ScanResult
+    │
+    ├── <a href="src/breakbot/utils/"><b>utils/</b></a>           ← shared AWS session infrastructure  (<a href="src/breakbot/utils/README.md">README</a>)
+    │   └── aws_session.py       boto3 session · client cache · retry config
+    │
+    ├── <a href="src/breakbot/scanner/"><b>scanner/</b></a>         ← Phase 2 — AWS resource discovery  (<a href="src/breakbot/scanner/README.md">README</a>)
+    │   ├── base.py              abstract base — multi-region orchestration
+    │   ├── compute.py           EC2 instances · Lambda functions
+    │   ├── networking.py        VPCs · subnets · security groups · ALBs
+    │   ├── data.py              S3 buckets · RDS instances
+    │   └── identity.py          IAM roles · users · policy documents
+    │
+    ├── <a href="src/breakbot/graph/"><b>graph/</b></a>           ← Phase 4 — dependency graph + serializer  (<a href="src/breakbot/graph/README.md">README</a>)
+    │   ├── edges.py             EdgeType enum · INTERNET virtual node
+    │   ├── builder.py           GraphBuilder — infers 8 edge types from scan
+    │   ├── serializer.py        GraphSerializer — compact LLM-ready text
+    │   └── visualize.py         pyvis HTML renderer
+    │
+    ├── <a href="src/breakbot/brain/"><b>brain/</b></a>           ← Phase 5 — LLM reasoning  [TBD]
+    │
+    └── <a href="src/breakbot/cli/"><b>cli/</b></a>             ← CLI entry points  (<a href="src/breakbot/cli/README.md">README</a>)
+        └── main.py              breakbot scan · breakbot graph · breakbot validate
+</pre>
+
+---
+
 ## How It Works — Full Pipeline
 
 ```
@@ -126,73 +163,28 @@ BreakBot builds the chain.
 
 ---
 
-## Project Layout
-
-```
-Phase1-VulnarabilitiReport/
-│
-├── pyproject.toml                  ← Package config, deps, CLI entry point
-│
-├── src/breakbot/
-│   │
-│   ├── models/                     ← Pydantic schemas (the data contracts)
-│   │   └── resource.py             ← Resource, ResourceType, ScanResult
-│   │
-│   ├── utils/                      ← Shared infrastructure
-│   │   └── aws_session.py          ← Boto3 session, client cache, retry config
-│   │
-│   ├── scanner/                    ← AWS resource discovery (Phase 2)
-│   │   ├── base.py                 ← Abstract base — multi-region orchestration
-│   │   ├── compute.py              ← EC2 instances + Lambda functions
-│   │   ├── networking.py           ← VPC, subnets, security groups, ALBs
-│   │   ├── data.py                 ← S3 buckets + RDS instances
-│   │   └── identity.py             ← IAM roles, users, policy documents
-│   │
-│   ├── graph/                      ← Dependency graph construction (Phase 4)
-│   │   ├── edges.py                ← EdgeType enum + INTERNET virtual node
-│   │   ├── builder.py              ← GraphBuilder — infers all edges from scan
-│   │   ├── serializer.py           ← GraphSerializer — compact LLM-ready text
-│   │   └── visualize.py            ← pyvis HTML renderer (requires [viz] extra)
-│   │
-│   ├── brain/                      ← LLM attack-path reasoning (Phase 5 — TBD)
-│   │   └── __init__.py
-│   │
-│   └── cli/
-│       └── main.py                 ← typer CLI: `breakbot scan`, `breakbot graph`
-│
-└── tests/
-    ├── unit/
-    │   ├── test_compute_scanner.py ← moto-mocked scanner tests (3 tests)
-    │   └── test_graph_builder.py   ← graph edge inference tests (14 tests)
-    └── integration/                ← Real AWS tests (opt-in, needs creds)
-```
-
----
-
 ## Quick Start
 
 ```bash
-# 1. Install (uv recommended, or pip)
+# 1. Install  (uv is faster; pip also works)
 uv pip install -e ".[dev]"
-# or: pip install -e ".[dev]"
 
-# 2. Create a read-only IAM user in your AWS account
-#    Attach the AWS-managed ReadOnlyAccess policy
-#    Generate an access key + secret
+# 2. Create a read-only IAM user in AWS Console
+#    → Attach the AWS-managed ReadOnlyAccess policy
+#    → Generate Access Key ID + Secret Access Key
 
-# 3. Configure your AWS profile
+# 3. Configure an AWS profile for BreakBot
 aws configure --profile breakbot
-# Enter: Access Key ID, Secret Access Key, region (e.g. us-east-1), output (json)
 
-# 4. Validate the profile is actually read-only
+# 4. Confirm the profile is actually read-only (runs a positive + negative test)
 breakbot validate --profile breakbot
 
-# 5. Run a full scan
+# 5. Scan a region
 breakbot scan --profile breakbot --region us-east-1
 
-# 6. Build the dependency graph from the scan
+# 6. Build the dependency graph and get LLM-ready output
 breakbot graph scans/scan-YYYYMMDD-HHMMSS-xxxxxx \
-    --html graph.html \
+    --html    graph.html         \
     --serialize attack_surface.txt
 ```
 
@@ -201,24 +193,27 @@ breakbot graph scans/scan-YYYYMMDD-HHMMSS-xxxxxx \
 ## CLI Reference
 
 ```
-breakbot scan      Run a read-only scan of the AWS account
-  --profile   -p   AWS profile name (default: "default")
-  --region    -r   Primary region (default: us-east-1)
-  --all-regions    Scan every enabled region in the account
-  --domain    -d   Restrict to one domain: compute | networking | data | identity
-  --output    -o   Output directory (default: ./scans)
-  --verbose   -v   Debug logging
+breakbot scan       Run a read-only scan of the AWS account
+  --profile   -p    AWS profile name           (default: "default")
+  --region    -r    Primary region             (default: us-east-1)
+  --all-regions     Scan every enabled region in the account
+  --domain    -d    Restrict scan: compute | networking | data | identity
+  --output    -o    Output directory           (default: ./scans)
+  --verbose   -v    Debug-level logging
 
-breakbot graph     Build dependency graph from a completed scan
-  SCAN_DIR         Path to scan output directory (required)
-  --html           Save interactive HTML visualization
-  --serialize -s   Save LLM-ready compact text
-  --max-hops       Max path length for entry→sink search (default: 5)
+breakbot graph      Build dependency graph from a completed scan
+  SCAN_DIR          Path to scan output directory  (required)
+  --html            Save interactive HTML visualization
+  --serialize -s    Save LLM-ready compact text
+  --max-hops        Max path length for entry→sink BFS  (default: 5)
+  --verbose   -v    Debug-level logging
 
-breakbot validate  Verify credentials are actually read-only
-  --profile   -p   AWS profile name
-  --region    -r   Region to test
+breakbot validate   Verify credentials are read-only before scanning
+  --profile   -p    AWS profile name
+  --region    -r    Region to test
 ```
+
+Full command docs: [cli/README.md →](src/breakbot/cli/README.md)
 
 ---
 
@@ -226,11 +221,11 @@ breakbot validate  Verify credentials are actually read-only
 
 | File | What it is |
 |---|---|
-| `scans/{id}/scan.json` | Full scan result — all resources, all errors |
-| `scans/{id}/ec2_instance.json` | Per-resource-type split for readability |
-| `graph.html` | Interactive pyvis graph, colour-coded by resource type |
-| `attack_surface.txt` | Compact text fed to the LLM |
-| `report.md` | *(Phase 5)* Human-readable attack path report |
+| `scans/{id}/scan.json` | Full `ScanResult` — all resources + all errors |
+| `scans/{id}/ec2_instance.json` | Per-type split for human inspection |
+| `graph.html` | Interactive pyvis graph, colour-coded by risk level |
+| `attack_surface.txt` | Compact text fed to the LLM brain |
+| `report.md` | *(Phase 5)* Human-readable attack path report with remediation |
 
 ---
 
@@ -238,14 +233,14 @@ breakbot validate  Verify credentials are actually read-only
 
 | Layer | Technology |
 |---|---|
-| AWS SDK | boto3 + botocore (adaptive retry, 10 attempts) |
-| Data validation | Pydantic v2 |
-| Graph | networkx.MultiDiGraph |
-| CLI | typer + rich |
-| LLM | Anthropic Claude API (claude-sonnet-4-6 / opus-4-7) |
-| Visualization | pyvis (vis.js wrapper) |
-| Testing | pytest + moto (AWS mocking) |
-| Packaging | uv / pip, pyproject.toml |
+| AWS SDK | `boto3` + `botocore` — adaptive retry, 10 max attempts |
+| Data validation | `pydantic` v2 |
+| Graph | `networkx.MultiDiGraph` |
+| CLI | `typer` + `rich` |
+| LLM | Anthropic Claude API — `claude-sonnet-4-6` / `opus-4-7` |
+| Visualization | `pyvis` (vis.js wrapper) |
+| Testing | `pytest` + `moto` (AWS service mocking) |
+| Packaging | `uv` / `pip`, `pyproject.toml` |
 
 ---
 
@@ -263,16 +258,22 @@ breakbot validate  Verify credentials are actually read-only
 
 ## Design Decisions
 
-**Why read-only?** The scanner attaches only `ReadOnlyAccess`. It cannot create, modify,
-or delete any resource. This makes it safe to run against production accounts.
+**Why read-only?**
+The scanner attaches only `ReadOnlyAccess`. It cannot create, modify, or delete
+any resource. Safe to run against production accounts without approval gates.
 
-**Why networkx?** The graph is built deterministically from API responses — no ML involved.
-networkx gives us shortest-path algorithms, BFS, and subgraph extraction out of the box.
+**Why networkx instead of a graph database?**
+The graph is built in-memory from a single scan result, lives for one analysis
+session, and is never persisted across runs. `networkx` gives BFS, shortest-path,
+and subgraph extraction out of the box — no server, no schema migration, no ops.
 
-**Why not train a model?** Training needs labeled attack-path data that doesn't exist publicly.
-Claude's reasoning over a well-structured graph outperforms fine-tuned smaller models for
-this task. The "intelligence" is in the prompt pipeline, not the weights.
+**Why not train a model?**
+Training requires labeled attack-path datasets that don't exist publicly and
+GPUs that a solo project doesn't have. Claude's out-of-the-box reasoning over
+a well-structured graph outperforms any fine-tuned smaller model for this task.
+The intelligence is in the prompt pipeline, not the weights.
 
-**Why compact text instead of JSON for the LLM?** A well-formatted flat text representation
-is ~10× more token-efficient than nested JSON and produces better LLM reasoning because
-the structure matches how a security engineer would describe a graph verbally.
+**Why compact text instead of JSON for the LLM context?**
+A flat text representation is ~10× more token-efficient than nested JSON and
+produces better reasoning because the format mirrors how a security engineer
+would verbally describe a dependency graph — not a data serialization format.
