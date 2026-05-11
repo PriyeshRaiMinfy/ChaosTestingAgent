@@ -8,16 +8,16 @@ downstream consumes this output — it doesn't talk to AWS directly.
 
 ## Architecture
 
-```
-BaseScanner (abstract)
+<pre>
+<a href="base.py"><b>BaseScanner</b></a> (abstract)
 │   scan(regions)  ← orchestrates multi-region, error isolation, timing
 │   _scan_region() ← implemented by each subclass
 │
-├── ComputeScanner   (compute.py)    EC2 instances + Lambda functions
-├── NetworkingScanner (networking.py) VPC + subnets + SGs + ALBs
-├── DataScanner      (data.py)       S3 buckets + RDS instances
-└── IdentityScanner  (identity.py)   IAM roles + users + policy documents
-```
+├── <a href="compute.py"><b>ComputeScanner</b></a>    EC2 instances + Lambda functions
+├── <a href="networking.py"><b>NetworkingScanner</b></a>  VPC + subnets + SGs + ALBs
+├── <a href="data.py"><b>DataScanner</b></a>       S3 buckets + RDS instances
+└── <a href="identity.py"><b>IdentityScanner</b></a>   IAM roles + users + policy documents
+</pre>
 
 ### BaseScanner contract
 
@@ -36,7 +36,7 @@ The base class handles:
 
 ## Scanners
 
-### ComputeScanner — `compute.py`
+### ComputeScanner — [`compute.py`](compute.py)
 
 ```
 EC2 instances
@@ -64,7 +64,7 @@ accidentally logging secrets.
 
 ---
 
-### NetworkingScanner — `networking.py`
+### NetworkingScanner — [`networking.py`](networking.py)
 
 ```
 VPCs
@@ -92,7 +92,7 @@ find internet entry points in O(1) without reparsing every rule.
 
 ---
 
-### DataScanner — `data.py`
+### DataScanner — [`data.py`](data.py)
 
 ```
 S3 Buckets  (global — scanned once regardless of how many regions are targeted)
@@ -126,7 +126,7 @@ not errors, so a partial S3 inventory is still returned.
 
 ---
 
-### IdentityScanner — `identity.py`
+### IdentityScanner — [`identity.py`](identity.py)
 
 The most important scanner. IAM is the backbone of almost every attack chain.
 
@@ -226,9 +226,9 @@ This means you always get partial results. The LLM report will note coverage gap
 ## Adding a New Scanner
 
 1. Create `scanner/newdomain.py`
-2. Subclass `BaseScanner`
+2. Subclass [`BaseScanner`](base.py)
 3. Implement `_scan_region(region) -> list[Resource]`
-4. Add any new `ResourceType` variants to `models/resource.py`
-5. Register in `scanner/__init__.py` and `cli/main.py`
+4. Add any new `ResourceType` variants to [`models/resource.py`](../models/resource.py)
+5. Register in [`scanner/__init__.py`](__init__.py) and [`cli/main.py`](../cli/main.py)
 
-See `compute.py` as the reference implementation.
+See [`compute.py`](compute.py) as the reference implementation.

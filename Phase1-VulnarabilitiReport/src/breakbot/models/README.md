@@ -7,6 +7,8 @@ The CLI serializes them to disk as `ScanResult` JSON.
 Nothing in the codebase passes raw boto3 dicts between modules — everything is
 normalized into these models first.
 
+**Source:** [`resource.py`](resource.py)
+
 ---
 
 ## `Resource`

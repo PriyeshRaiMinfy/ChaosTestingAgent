@@ -7,13 +7,13 @@ then serializes that graph into a compact format optimised for LLM reasoning.
 
 ## Files
 
-```
+<pre>
 graph/
-├── edges.py       EdgeType enum + INTERNET virtual node constant
-├── builder.py     GraphBuilder — constructs the networkx graph from ScanResult
-├── serializer.py  GraphSerializer — filters to attack surface, emits compact text
-└── visualize.py   render_html() — interactive pyvis HTML output
-```
+├── <a href="edges.py"><b>edges.py</b></a>       EdgeType enum + INTERNET virtual node constant
+├── <a href="builder.py"><b>builder.py</b></a>     GraphBuilder — constructs the networkx graph from ScanResult
+├── <a href="serializer.py"><b>serializer.py</b></a>  GraphSerializer — filters to attack surface, emits compact text
+└── <a href="visualize.py"><b>visualize.py</b></a>   render_html() — interactive pyvis HTML output
+</pre>
 
 ---
 
@@ -132,7 +132,7 @@ in ≤5 hops and includes it in `attack_surface.txt` for the LLM to reason over.
 
 ---
 
-## GraphBuilder
+## GraphBuilder — [`builder.py`](builder.py)
 
 ```python
 from breakbot.graph import GraphBuilder
@@ -145,23 +145,23 @@ graph   = builder.build()         # networkx.MultiDiGraph
 arn_idx = builder.arn_index       # dict[str, Resource]
 ```
 
-`build()` runs 8 inference passes in order:
+`build()` runs 9 inference passes in order:
 
-```
-1. _build_indexes()          ← build ARN / SG-ID / role-name / VPC-ID lookup dicts
-2. _add_all_nodes()          ← add every resource + INTERNET virtual node
-3. _add_iam_trust_edges()    ← iam_can_assume (from trust policies)
-4. _add_compute_role_edges() ← has_execution_role + has_instance_profile
-5. _add_sg_attachment_edges() ← attached_to_sg
-6. _add_network_reachability_edges() ← network_can_reach
+<pre>
+1. _build_indexes()                 ← ARN / SG-ID / role-name / VPC-ID lookup dicts
+2. _add_all_nodes()                 ← every resource + INTERNET virtual node
+3. _add_iam_trust_edges()           ← iam_can_assume  (from trust policies)
+4. _add_compute_role_edges()        ← has_execution_role + has_instance_profile
+5. _add_sg_attachment_edges()       ← attached_to_sg
+6. _add_network_reachability_edges()← network_can_reach
 7. _add_internet_exposure_edges()   ← internet_exposes
 8. _add_iam_policy_access_edges()   ← iam_can_access
 9. _add_vpc_membership_edges()      ← in_vpc
-```
+</pre>
 
 ---
 
-## GraphSerializer
+## GraphSerializer — [`serializer.py`](serializer.py)
 
 ```python
 from breakbot.graph import GraphSerializer
@@ -197,7 +197,7 @@ avoid token explosion in accounts with thousands of resources.
 
 ---
 
-## Visualization
+## Visualization — [`visualize.py`](visualize.py)
 
 Requires the `viz` extra: `pip install breakbot[viz]`
 
