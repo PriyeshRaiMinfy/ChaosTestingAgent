@@ -4,7 +4,7 @@ The `breakbot` CLI is the primary user-facing interface. Built with
 [typer](https://typer.tiangolo.com/) and [rich](https://github.com/Textualize/rich)
 for coloured terminal output and structured tables.
 
-Entry point is registered in `pyproject.toml`:
+Entry point is registered in [`pyproject.toml`](../../../pyproject.toml):
 ```toml
 [project.scripts]
 breakbot = "breakbot.cli.main:app"
@@ -192,7 +192,7 @@ Building dependency graph...
 
 ## Adding a New Command
 
-1. Open `cli/main.py`
+1. Open [`main.py`](main.py)
 2. Decorate a function with `@app.command()`
 3. Use `typer.Option` / `typer.Argument` for parameters
 4. Use `console.print(...)` for rich-formatted output

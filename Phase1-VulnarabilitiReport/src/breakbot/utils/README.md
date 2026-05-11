@@ -1,10 +1,10 @@
 # Utils
 
-Shared infrastructure used by every scanner. Currently one module: `aws_session.py`.
+Shared infrastructure used by every scanner. Currently one module: [`aws_session.py`](aws_session.py).
 
 ---
 
-## `AWSSession`
+## `AWSSession` — [`aws_session.py`](aws_session.py)
 
 A thin wrapper around `boto3.Session` that adds:
 
