@@ -38,6 +38,7 @@ class NetworkingScanner(BaseScanner):
         resources.extend(self._scan_vpcs(region))
         resources.extend(self._scan_security_groups(region))
         resources.extend(self._scan_albs(region))
+        resources.extend(self._scan_target_groups(region))
         resources.extend(self._scan_nat_gateways(region))
         resources.extend(self._scan_internet_gateways(region))
         return resources
@@ -159,15 +160,20 @@ class NetworkingScanner(BaseScanner):
     def _normalize_alb(self, lb: dict, region: str) -> Resource:
         arn = lb["LoadBalancerArn"]
         name = lb["LoadBalancerName"]
+        lb_type = lb.get("Type", "application")
         is_internet_facing = lb.get("Scheme") == "internet-facing"
 
         properties = {
-            "lb_type": lb.get("Type"),
+            "lb_type": lb_type,
             "scheme": lb.get("Scheme"),
             "is_internet_facing": is_internet_facing,
+            "is_nlb": lb_type == "network",
+            "is_alb": lb_type == "application",
+            "is_gwlb": lb_type == "gateway",
             "vpc_id": lb.get("VpcId"),
             "dns_name": lb.get("DNSName"),
             "availability_zones": [az["ZoneName"] for az in lb.get("AvailabilityZones", [])],
+            # NLBs do not use security groups; this will be empty for them
             "security_group_ids": lb.get("SecurityGroups", []),
             "state": lb.get("State", {}).get("Code"),
         }
@@ -175,6 +181,48 @@ class NetworkingScanner(BaseScanner):
         return Resource(
             arn=arn,
             resource_type=ResourceType.ALB,
+            name=name,
+            region=region,
+            account_id=self.session.account_id,
+            properties=properties,
+        )
+
+    # ─────────────────────── Target Groups ────────────────────────────────
+
+    def _scan_target_groups(self, region: str) -> list[Resource]:
+        elbv2 = self.session.client("elbv2", region=region)
+        paginator = elbv2.get_paginator("describe_target_groups")
+        resources: list[Resource] = []
+        try:
+            for page in paginator.paginate():
+                for tg in page.get("TargetGroups", []):
+                    resources.append(self._normalize_target_group(tg, region))
+        except ClientError as e:
+            logger.warning(
+                "Target group scan failed in %s: %s",
+                region, e.response["Error"]["Code"],
+            )
+        return resources
+
+    def _normalize_target_group(self, tg: dict, region: str) -> Resource:
+        arn = tg["TargetGroupArn"]
+        name = tg["TargetGroupName"]
+
+        properties = {
+            "target_group_name": name,
+            "protocol": tg.get("Protocol"),          # HTTP, HTTPS, TCP, TLS, UDP, TCP_UDP, GENEVE
+            "port": tg.get("Port"),
+            "vpc_id": tg.get("VpcId"),
+            "target_type": tg.get("TargetType"),     # instance, ip, lambda, alb
+            "health_check_enabled": tg.get("HealthCheckEnabled", True),
+            "health_check_protocol": tg.get("HealthCheckProtocol"),
+            "health_check_port": tg.get("HealthCheckPort"),
+            "lb_arns": tg.get("LoadBalancerArns", []),
+        }
+
+        return Resource(
+            arn=arn,
+            resource_type=ResourceType.LOAD_BALANCER_TARGET_GROUP,
             name=name,
             region=region,
             account_id=self.session.account_id,
