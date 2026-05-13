@@ -1,0 +1,134 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  BreakBot scanner role. Deploy this ONCE in the Audit account before
+  rolling out the BreakBotReadOnly StackSet to member accounts.
+
+  This role is the principal that BreakBot itself runs as. It needs:
+    - organizations:ListAccounts (to enumerate member accounts)
+    - sts:AssumeRole (to step into each member's BreakBotReadOnly role)
+
+  Attach this role to the EC2 instance, ECS task, or AWS CloudShell
+  session that runs the `breakbot` CLI.
+
+Parameters:
+  RoleName:
+    Type: String
+    Default: BreakBotScannerRole
+    Description: Name of the scanner role created in this (Audit) account.
+
+  AllowedAssumers:
+    Type: CommaDelimitedList
+    Description: >
+      Principals allowed to assume this scanner role. Examples:
+        arn:aws:iam::AUDIT_ID:user/security-engineer
+        arn:aws:iam::AUDIT_ID:role/AWSReservedSSO_AdminAccess_xxx
+      For an EC2/ECS deployment, leave this empty and instead use the
+      EnableEc2InstanceProfile parameter below.
+
+  EnableEc2InstanceProfile:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      If true, also create an EC2 instance profile that allows this role
+      to be attached to EC2 instances or ECS Fargate tasks.
+
+  MemberRoleName:
+    Type: String
+    Default: BreakBotReadOnly
+    Description: >
+      Name of the role this scanner is allowed to assume in member accounts.
+      Must match the RoleName parameter of the StackSet deployment.
+
+Conditions:
+  CreateInstanceProfile: !Equals [!Ref EnableEc2InstanceProfile, "true"]
+  HasHumanAssumers: !Not [!Equals [!Select [0, !Ref AllowedAssumers], ""]]
+
+Resources:
+  BreakBotScannerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: Principal that BreakBot runs as in the Audit account.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Human or SSO assumers (e.g. security engineer via CloudShell)
+          - !If
+            - HasHumanAssumers
+            - Effect: Allow
+              Principal:
+                AWS: !Ref AllowedAssumers
+              Action: sts:AssumeRole
+            - !Ref AWS::NoValue
+          # EC2 / ECS task role (Fargate uses ecs-tasks.amazonaws.com)
+          - !If
+            - CreateInstanceProfile
+            - Effect: Allow
+              Principal:
+                Service:
+                  - ec2.amazonaws.com
+                  - ecs-tasks.amazonaws.com
+              Action: sts:AssumeRole
+            - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: BreakBotOrgEnumeration
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - organizations:DescribeOrganization
+                  - organizations:DescribeAccount
+                  - organizations:ListOrganizationalUnitsForParent
+                  - organizations:ListRoots
+                Resource: "*"
+
+        - PolicyName: BreakBotAssumeMemberRoles
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                # Allow assuming the BreakBotReadOnly role in any account
+                # within this Organization. The wildcard on account_id is
+                # safe because the destination role's trust policy restricts
+                # the assumer back to this scanner role.
+                # ${AWS::Partition} keeps this valid in GovCloud and China.
+                Resource: !Sub "arn:${AWS::Partition}:iam::*:role/${MemberRoleName}"
+
+        - PolicyName: BreakBotSelfIdentify
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                  - ec2:DescribeRegions
+                Resource: "*"
+      Tags:
+        - Key: ManagedBy
+          Value: BreakBot
+        - Key: Purpose
+          Value: ScannerPrincipal
+
+  BreakBotInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: CreateInstanceProfile
+    Properties:
+      InstanceProfileName: !Ref RoleName
+      Roles:
+        - !Ref BreakBotScannerRole
+
+Outputs:
+  ScannerRoleArn:
+    Description: >
+      ARN of the scanner role. Pass this to the StackSet deployment as
+      TrustedScannerPrincipalArn so member accounts trust it.
+    Value: !GetAtt BreakBotScannerRole.Arn
+
+  InstanceProfileArn:
+    Condition: CreateInstanceProfile
+    Description: Instance profile for attaching to EC2 / ECS Fargate.
+    Value: !GetAtt BreakBotInstanceProfile.Arn

@@ -1,0 +1,121 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  BreakBot read-only IAM role. Deploy as a StackSet from the Management
+  account so every member account in the Organization receives the role.
+  Once deployed, the central scanner (running in the Audit account) can
+  assume this role to enumerate resources without write permissions.
+
+Parameters:
+  TrustedScannerPrincipalArn:
+    Type: String
+    Description: >
+      ARN of the principal allowed to assume BreakBotReadOnly. This is
+      normally the IAM role or user that BreakBot runs as in the Audit
+      account, e.g. arn:aws:iam::AUDIT_ACCOUNT_ID:role/BreakBotScannerRole
+      or arn:aws:iam::AUDIT_ACCOUNT_ID:root for "any principal in Audit".
+    # Partition-flexible pattern: matches aws, aws-us-gov, aws-cn
+    AllowedPattern: "^arn:aws[-a-z]*:iam::[0-9]{12}:(root|role/.+|user/.+)$"
+
+  RoleName:
+    Type: String
+    Default: BreakBotReadOnly
+    Description: >
+      Name of the role created in every member account. Must match the
+      --member-role flag passed to breakbot scan.
+
+  ExternalId:
+    Type: String
+    Default: ""
+    Description: >
+      Optional ExternalId required for sts:AssumeRole. Pass the same value
+      via breakbot scan --external-id. Leave empty to disable.
+
+  MaxSessionDurationSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 900
+    MaxValue: 43200
+    Description: >
+      Max duration of an assumed session. 3600 (1 hour) is the default and
+      is sufficient for most scans. Large organizations may need longer.
+
+Conditions:
+  HasExternalId: !Not [!Equals [!Ref ExternalId, ""]]
+
+Resources:
+  BreakBotReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      MaxSessionDuration: !Ref MaxSessionDurationSeconds
+      Description: >
+        Read-only role assumed by BreakBot to inventory resources and
+        produce attack-path findings. Grants Describe/List/Get only.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref TrustedScannerPrincipalArn
+            Action: sts:AssumeRole
+            Condition: !If
+              - HasExternalId
+              - StringEquals:
+                  sts:ExternalId: !Ref ExternalId
+              - !Ref AWS::NoValue
+      # AWS-managed ReadOnlyAccess covers ~99% of what BreakBot needs.
+      # It grants every Get*/List*/Describe* across all services with no
+      # write capability. Verified by `breakbot validate` before each scan.
+      # ${AWS::Partition} keeps this valid in GovCloud and China.
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess"
+      Policies:
+        # IAM policy document inspection requires GetPolicyVersion, which
+        # ReadOnlyAccess already grants but we make it explicit here so a
+        # narrower future ReadOnlyAccess revision cannot silently break us.
+        - PolicyName: BreakBotIamInspection
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:ListPolicyVersions
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:GetUserPolicy
+                  - iam:ListUserPolicies
+                  - iam:ListAttachedUserPolicies
+                Resource: "*"
+
+        # CloudTrail Event History (Phase 3 behavioral overlay). Free in
+        # every AWS account, no Trail needs to be configured. Without this
+        # the behavioral edges (actually_assumed, actually_accessed) cannot
+        # be built.
+        - PolicyName: BreakBotCloudTrailLookup
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                  - cloudtrail:DescribeTrails
+                  - cloudtrail:GetTrailStatus
+                  - cloudtrail:GetEventSelectors
+                Resource: "*"
+      Tags:
+        - Key: ManagedBy
+          Value: BreakBot
+        - Key: Purpose
+          Value: ReadOnlySecurityScan
+
+Outputs:
+  RoleArn:
+    Description: ARN of the BreakBot read-only role in this account
+    Value: !GetAtt BreakBotReadOnlyRole.Arn
+
+  RoleName:
+    Description: Name of the BreakBot role (pass to breakbot --member-role)
+    Value: !Ref RoleName
