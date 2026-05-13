@@ -5,6 +5,7 @@ Commands:
   validate  Verify credentials are read-only (and reachable across the Org if --org)
   scan      Run a full scan of one account, or every account in the Organization
   graph     Build the dependency graph from a completed scan
+  posture   Re-run posture analysis on a completed scan (no AWS calls)
 
 Single-account usage:
   breakbot validate --profile breakbot --region us-east-1
@@ -29,6 +30,7 @@ from rich.table import Table
 
 from breakbot.graph import GraphBuilder, GraphSerializer
 from breakbot.models import Resource, ScanResult
+from breakbot.posture import PostureAnalyzer
 from breakbot.org import (
     DEFAULT_MEMBER_ROLE,
     CrossAccountSessionFactory,
@@ -318,6 +320,18 @@ def scan(
     )
     console.print()
     console.print(table)
+
+    # Posture analysis — no additional AWS calls, runs on the scan result in memory
+    console.print("\n[bold]Running posture analysis...[/bold]")
+    posture_findings = PostureAnalyzer().analyze(result)
+    (scan_dir / "posture.json").write_text(
+        json.dumps([f.to_dict() for f in posture_findings], indent=2)
+    )
+    _print_posture_summary(console, posture_findings)
+    console.print(
+        f"[green]✔[/green] Posture findings written to [bold]{scan_dir / 'posture.json'}[/bold]"
+    )
+
     console.print(f"\n[green]✔[/green] Written to [bold]{scan_dir}[/bold]")
 
 
@@ -484,6 +498,93 @@ def graph(
 
     if not html and not serialize:
         console.print("\n[dim]Tip: use --html graph.html or --serialize attack_surface.txt[/dim]")
+
+
+def _print_posture_summary(con: Console, findings: list) -> None:
+    from collections import Counter
+    from breakbot.posture.findings import Severity
+
+    counts = Counter(f.severity.value for f in findings)
+    if not any(counts.values()):
+        con.print("[green]No posture findings.[/green]")
+        return
+
+    _SEV_STYLE = {
+        Severity.CRITICAL.value: "bold red",
+        Severity.HIGH.value:     "red",
+        Severity.MEDIUM.value:   "yellow",
+        Severity.LOW.value:      "blue",
+        Severity.INFO.value:     "dim",
+    }
+    t = Table(title="Posture findings")
+    t.add_column("Severity", style="bold")
+    t.add_column("Count", justify="right")
+    for sev in [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW, Severity.INFO]:
+        n = counts.get(sev.value, 0)
+        if n:
+            t.add_row(f"[{_SEV_STYLE[sev.value]}]{sev.value}[/{_SEV_STYLE[sev.value]}]", str(n))
+    con.print(t)
+
+
+@app.command()
+def posture(
+    scan_dir: Path = typer.Argument(..., help="Path to a scan output directory (e.g. scans/scan-...)"),
+    severity: str = typer.Option(
+        None, "--severity", "-s",
+        help="Show only findings at or above this level (CRITICAL, HIGH, MEDIUM, LOW).",
+    ),
+    category: str = typer.Option(
+        None, "--category", "-c",
+        help="Show only findings in this category (network, encryption, identity, compute, data, waf).",
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o",
+        help="Write findings to a JSON file (re-writes posture.json by default).",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Run posture analysis on a completed scan — no AWS calls required."""
+    _configure_logging(verbose)
+
+    scan_file = scan_dir / "scan.json"
+    if not scan_file.exists():
+        console.print(f"[red]No scan.json found in {scan_dir}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"Loading scan from [bold]{scan_file}[/bold]")
+    result = ScanResult.model_validate_json(scan_file.read_text())
+    console.print(f"Loaded [yellow]{result.resource_count}[/yellow] resources")
+
+    findings = PostureAnalyzer().analyze(result)
+
+    # Filter
+    _SEV_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+    if severity:
+        sev_upper = severity.upper()
+        if sev_upper not in _SEV_ORDER:
+            console.print(f"[red]Unknown severity: {severity}[/red]")
+            raise typer.Exit(1)
+        cutoff = _SEV_ORDER.index(sev_upper)
+        findings = [f for f in findings if _SEV_ORDER.index(f.severity.value) <= cutoff]
+
+    if category:
+        findings = [f for f in findings if f.category == category.lower()]
+
+    _print_posture_summary(console, findings)
+
+    dest = output or (scan_dir / "posture.json")
+    dest.write_text(json.dumps([f.to_dict() for f in findings], indent=2))
+    console.print(f"[green]✔[/green] {len(findings)} finding(s) written to [bold]{dest}[/bold]")
+
+    # Print individual findings if verbose
+    if verbose:
+        for f in findings:
+            console.print(
+                f"\n[bold]{f.severity.value}[/bold] [{f.check_id}] {f.title}\n"
+                f"  Resource: {f.resource_name} ({f.resource_arn})\n"
+                f"  Detail:   {f.detail}\n"
+                f"  Fix:      {f.remediation}"
+            )
 
 
 if __name__ == "__main__":
