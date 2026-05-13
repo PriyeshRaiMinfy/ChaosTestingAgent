@@ -37,8 +37,10 @@ from breakbot.org import (
 from breakbot.scanner import (
     ComputeScanner,
     DataScanner,
+    EksScanner,
     IdentityScanner,
     NetworkingScanner,
+    SecretsScanner,
 )
 from breakbot.utils import AWSSession
 
@@ -54,6 +56,8 @@ SCANNER_REGISTRY = {
     "networking": NetworkingScanner,
     "data": DataScanner,
     "identity": IdentityScanner,
+    "eks": EksScanner,
+    "secrets": SecretsScanner,
 }
 
 
@@ -172,7 +176,7 @@ def scan(
     domains: list[str] = typer.Option(
         None,
         "--domain", "-d",
-        help="Restrict to specific domains: compute, networking, data, identity",
+        help="Restrict to specific domains: compute, networking, data, identity, eks, secrets",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
 ):

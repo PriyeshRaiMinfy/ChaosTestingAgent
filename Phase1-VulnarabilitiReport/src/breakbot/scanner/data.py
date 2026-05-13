@@ -1,15 +1,14 @@
 """
-Data store scanner — S3 buckets and RDS instances.
+Data store scanner — S3, RDS, DynamoDB, and ElastiCache.
 
 S3 is global, so we scan once and resolve each bucket's actual region via
-GetBucketLocation. RDS is regional.
+GetBucketLocation. The others are regional.
 
 What we care about for graph reasoning:
-  S3:  public access block, bucket policy presence, encryption, ACL grants
-  RDS: publicly_accessible flag, encryption, VPC subnet group, master username
-
-These properties drive `holds_sensitive_data` flags and influence severity
-scoring in the LLM phase.
+  S3:            public access block, bucket policy presence, encryption
+  RDS:           publicly_accessible, encryption, VPC placement
+  DynamoDB:      encryption type (AES256 vs KMS), deletion protection, streams
+  ElastiCache:   encryption at rest/in transit, auth token, security groups
 """
 from __future__ import annotations
 
@@ -39,6 +38,8 @@ class DataScanner(BaseScanner):
             self._s3_scanned = True
             resources.extend(self._scan_s3())
         resources.extend(self._scan_rds(region))
+        resources.extend(self._scan_dynamodb(region))
+        resources.extend(self._scan_elasticache(region))
         return resources
 
     # ───────────────────────────── S3 ────────────────────────────────────
@@ -188,6 +189,175 @@ class DataScanner(BaseScanner):
             arn=arn,
             resource_type=ResourceType.RDS_INSTANCE,
             name=db_id,
+            region=region,
+            account_id=self.session.account_id,
+            properties=properties,
+        )
+
+    # ─────────────────────────── DynamoDB ────────────────────────────────
+
+    def _scan_dynamodb(self, region: str) -> list[Resource]:
+        ddb = self.session.client("dynamodb", region=region)
+        paginator = ddb.get_paginator("list_tables")
+        resources: list[Resource] = []
+        try:
+            for page in paginator.paginate():
+                for table_name in page["TableNames"]:
+                    try:
+                        resp = ddb.describe_table(TableName=table_name)
+                        resources.append(self._normalize_dynamodb(resp["Table"], region))
+                    except ClientError as e:
+                        logger.warning(
+                            "DescribeTable %s failed: %s",
+                            table_name,
+                            e.response["Error"]["Code"],
+                        )
+        except ClientError as e:
+            logger.warning(
+                "DynamoDB scan failed in %s: %s", region, e.response["Error"]["Code"]
+            )
+            raise
+        return resources
+
+    def _normalize_dynamodb(self, table: dict, region: str) -> Resource:
+        table_name = table["TableName"]
+        arn = table["TableArn"]
+
+        sse = table.get("SSEDescription", {}) or {}
+        kms_key_arn = sse.get("KMSMasterKeyArn")
+
+        stream_spec = table.get("StreamSpecification", {}) or {}
+
+        properties = {
+            "table_name": table_name,
+            "status": table.get("TableStatus"),
+            "billing_mode": (
+                table.get("BillingModeSummary", {}).get("BillingMode") or "PROVISIONED"
+            ),
+            "item_count": table.get("ItemCount", 0),
+            "size_bytes": table.get("TableSizeBytes", 0),
+            "sse_type": sse.get("SSEType"),  # AES256 or KMS
+            "sse_enabled": sse.get("Status") == "ENABLED",
+            "kms_key_arn": kms_key_arn,
+            "stream_enabled": bool(stream_spec.get("StreamEnabled")),
+            "deletion_protection": table.get("DeletionProtectionEnabled", False),
+        }
+
+        return Resource(
+            arn=arn,
+            resource_type=ResourceType.DYNAMODB_TABLE,
+            name=table_name,
+            region=region,
+            account_id=self.session.account_id,
+            properties=properties,
+        )
+
+    # ─────────────────────────── ElastiCache ─────────────────────────────
+
+    def _scan_elasticache(self, region: str) -> list[Resource]:
+        ec = self.session.client("elasticache", region=region)
+        resources: list[Resource] = []
+        seen_rg_ids: set[str] = set()
+
+        # Redis replication groups — the logical cluster entity (primary + replicas)
+        try:
+            paginator = ec.get_paginator("describe_replication_groups")
+            for page in paginator.paginate():
+                for rg in page["ReplicationGroups"]:
+                    resources.append(self._normalize_replication_group(rg, region))
+                    seen_rg_ids.add(rg["ReplicationGroupId"])
+        except ClientError as e:
+            logger.warning(
+                "ElastiCache DescribeReplicationGroups failed in %s: %s",
+                region,
+                e.response["Error"]["Code"],
+            )
+
+        # Memcached clusters + single-node Redis not in a replication group
+        try:
+            paginator = ec.get_paginator("describe_cache_clusters")
+            for page in paginator.paginate():
+                for cluster in page["CacheClusters"]:
+                    rg_id = cluster.get("ReplicationGroupId")
+                    if rg_id and rg_id in seen_rg_ids:
+                        continue  # already covered above
+                    resources.append(self._normalize_cache_cluster(cluster, region))
+        except ClientError as e:
+            logger.warning(
+                "ElastiCache DescribeCacheClusters failed in %s: %s",
+                region,
+                e.response["Error"]["Code"],
+            )
+
+        return resources
+
+    def _normalize_replication_group(self, rg: dict, region: str) -> Resource:
+        rg_id = rg["ReplicationGroupId"]
+        arn = rg.get(
+            "ARN",
+            f"arn:aws:elasticache:{region}:{self.session.account_id}:replicationgroup:{rg_id}",
+        )
+        kms_key_arn = rg.get("KmsKeyId") or None  # may be key ARN or ID
+
+        properties = {
+            "cluster_id": rg_id,
+            "cluster_type": "redis_replication_group",
+            "engine": "redis",
+            "status": rg.get("Status"),
+            "node_type": rg.get("CacheNodeType"),
+            "multi_az": rg.get("MultiAZ") == "enabled",
+            "automatic_failover": rg.get("AutomaticFailover") == "enabled",
+            "cluster_mode": "enabled" if rg.get("ClusterEnabled") else "disabled",
+            "at_rest_encryption_enabled": rg.get("AtRestEncryptionEnabled", False),
+            "transit_encryption_enabled": rg.get("TransitEncryptionEnabled", False),
+            "auth_token_enabled": rg.get("AuthTokenEnabled", False),
+            "kms_key_arn": kms_key_arn,
+            "member_count": len(rg.get("MemberClusters", [])),
+            # SG IDs are only on member cache clusters, not on the replication group object
+            "security_group_ids": [],
+        }
+
+        return Resource(
+            arn=arn,
+            resource_type=ResourceType.ELASTICACHE_CLUSTER,
+            name=rg_id,
+            region=region,
+            account_id=self.session.account_id,
+            properties=properties,
+        )
+
+    def _normalize_cache_cluster(self, cluster: dict, region: str) -> Resource:
+        cluster_id = cluster["CacheClusterId"]
+        arn = cluster.get(
+            "ARN",
+            f"arn:aws:elasticache:{region}:{self.session.account_id}:cluster:{cluster_id}",
+        )
+        engine = cluster.get("Engine", "redis")
+        sg_ids = [sg["SecurityGroupId"] for sg in cluster.get("SecurityGroups", [])]
+        kms_key_arn = cluster.get("KmsKeyId") or None
+
+        cluster_type = "memcached_cluster" if engine == "memcached" else "redis_standalone"
+
+        properties = {
+            "cluster_id": cluster_id,
+            "cluster_type": cluster_type,
+            "engine": engine,
+            "engine_version": cluster.get("EngineVersion"),
+            "status": cluster.get("CacheClusterStatus"),
+            "node_type": cluster.get("CacheNodeType"),
+            "num_cache_nodes": cluster.get("NumCacheNodes", 1),
+            "at_rest_encryption_enabled": cluster.get("AtRestEncryptionEnabled", False),
+            "transit_encryption_enabled": cluster.get("TransitEncryptionEnabled", False),
+            "auth_token_enabled": cluster.get("AuthTokenEnabled", False),
+            "kms_key_arn": kms_key_arn,
+            "security_group_ids": sg_ids,
+            "cache_subnet_group_name": cluster.get("CacheSubnetGroupName"),
+        }
+
+        return Resource(
+            arn=arn,
+            resource_type=ResourceType.ELASTICACHE_CLUSTER,
+            name=cluster_id,
             region=region,
             account_id=self.session.account_id,
             properties=properties,

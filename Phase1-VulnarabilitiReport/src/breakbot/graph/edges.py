@@ -23,6 +23,11 @@ class EdgeType(str, Enum):
 
     # Structural / membership edges
     IN_VPC = "in_vpc"
+    HAS_NODE_GROUP = "has_node_group"          # EKS cluster → managed node group
+    HAS_FARGATE_PROFILE = "has_fargate_profile"  # EKS cluster → Fargate profile
+
+    # Encryption edges
+    ENCRYPTED_BY = "encrypted_by"  # resource → KMS key
 
 
 # Synthetic node IDs — not real AWS ARNs, but useful anchors in the graph.

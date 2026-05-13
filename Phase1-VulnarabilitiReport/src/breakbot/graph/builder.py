@@ -5,16 +5,21 @@ Every scanned AWS resource becomes a node keyed by its ARN.
 Relationships between resources become typed directed edges.
 
 Edge types built here (static graph only — behavioral edges from CloudTrail
-are added in Phase 4 overlay step):
+are added in Phase 3 overlay step):
 
-  iam_can_assume       Trust policy Principal  →  IAM Role
-  has_execution_role   Lambda                  →  IAM Role
-  has_instance_profile EC2                     →  IAM Role (best-effort via name match)
-  iam_can_access       IAM Role                →  Resource (from inline + managed policies)
-  attached_to_sg       EC2 / Lambda / RDS / ALB →  SecurityGroup
-  network_can_reach    SecurityGroup           →  SecurityGroup (ingress SG reference)
-  internet_exposes     INTERNET (virtual)      →  SecurityGroup (0.0.0.0/0 ingress)
-  in_vpc               Lambda / RDS / EC2      →  VPC
+  iam_can_assume       Trust policy Principal         →  IAM Role
+  has_execution_role   Lambda / EKS cluster/nodegroup →  IAM Role
+  has_instance_profile EC2                            →  IAM Role (best-effort name match)
+  iam_can_access       IAM Role                       →  Resource
+  attached_to_sg       EC2 / Lambda / RDS / ALB /
+                       EKS cluster / ElastiCache       →  SecurityGroup
+  network_can_reach    SecurityGroup                  →  SecurityGroup (ingress SG ref)
+  internet_exposes     INTERNET (virtual)             →  SecurityGroup (0.0.0.0/0 ingress)
+  in_vpc               Lambda / RDS / EC2 / EKS       →  VPC
+  has_node_group       EKS cluster                    →  EKS nodegroup
+  has_fargate_profile  EKS cluster                    →  EKS Fargate profile
+  encrypted_by         Secret / Param / DynamoDB /
+                       ElastiCache / EKS cluster       →  KMS key
 """
 from __future__ import annotations
 
@@ -43,9 +48,11 @@ class GraphBuilder:
 
         # Lookup tables populated during _build_indexes()
         self._arn_index: dict[str, Resource] = {}
-        self._sg_id_to_arn: dict[str, str] = {}      # sg-xxxxxx → ARN
-        self._role_name_to_arn: dict[str, str] = {}  # role name → ARN
-        self._vpc_id_to_arn: dict[str, str] = {}     # vpc-xxxxxx → ARN
+        self._sg_id_to_arn: dict[str, str] = {}             # sg-xxxxxx → ARN
+        self._role_name_to_arn: dict[str, str] = {}         # role name → ARN
+        self._vpc_id_to_arn: dict[str, str] = {}            # vpc-xxxxxx → ARN
+        self._eks_cluster_name_to_arn: dict[str, str] = {}  # cluster name → ARN
+        self._kms_key_id_to_arn: dict[str, str] = {}        # key UUID → ARN
 
     @property
     def arn_index(self) -> dict[str, Resource]:
@@ -58,11 +65,14 @@ class GraphBuilder:
         self._add_all_nodes()
         self._add_iam_trust_edges()
         self._add_compute_role_edges()
+        self._add_eks_role_edges()
+        self._add_eks_membership_edges()
         self._add_sg_attachment_edges()
         self._add_network_reachability_edges()
         self._add_internet_exposure_edges()
         self._add_iam_policy_access_edges()
         self._add_vpc_membership_edges()
+        self._add_encryption_edges()
 
         logger.info(
             "Graph built: %d nodes, %d edges",
@@ -92,6 +102,16 @@ class GraphBuilder:
                 vpc_id = resource.properties.get("vpc_id")
                 if vpc_id:
                     self._vpc_id_to_arn[vpc_id] = resource.arn
+
+            elif resource.resource_type == ResourceType.EKS_CLUSTER:
+                cluster_name = resource.properties.get("cluster_name")
+                if cluster_name:
+                    self._eks_cluster_name_to_arn[cluster_name] = resource.arn
+
+            elif resource.resource_type == ResourceType.KMS_KEY:
+                key_id = resource.properties.get("key_id")
+                if key_id:
+                    self._kms_key_id_to_arn[key_id] = resource.arn
 
     # ─────────────────────────── Nodes ────────────────────────────────────
 
@@ -211,6 +231,8 @@ class GraphBuilder:
             ResourceType.LAMBDA_FUNCTION: "security_group_ids",
             ResourceType.RDS_INSTANCE: "vpc_security_group_ids",
             ResourceType.ALB: "security_group_ids",
+            ResourceType.EKS_CLUSTER: "security_group_ids",
+            ResourceType.ELASTICACHE_CLUSTER: "security_group_ids",
         }
 
         for resource in self.result.resources:
@@ -367,11 +389,12 @@ class GraphBuilder:
     # ──────────────────── VPC Membership Edges ────────────────────────────
 
     def _add_vpc_membership_edges(self) -> None:
-        """Lambda, RDS, and EC2 → VPC when their vpc_id is known."""
+        """Lambda, RDS, EC2, and EKS clusters → VPC when their vpc_id is known."""
         _VPC_TYPES = {
             ResourceType.LAMBDA_FUNCTION,
             ResourceType.RDS_INSTANCE,
             ResourceType.EC2_INSTANCE,
+            ResourceType.EKS_CLUSTER,
         }
         for resource in self.result.resources:
             if resource.resource_type not in _VPC_TYPES:
@@ -387,6 +410,103 @@ class GraphBuilder:
                     edge_type=EdgeType.IN_VPC,
                     label=EdgeType.IN_VPC.value,
                 )
+
+    # ──────────────────── EKS Role Edges ──────────────────────────────────
+
+    def _add_eks_role_edges(self) -> None:
+        """
+        EKS cluster/nodegroup/Fargate profile → IAM role (has_execution_role).
+
+        Attack path significance:
+          - cluster role:   can call AWS APIs on behalf of the control plane
+          - node role:      attached to EC2 worker instances; SSRF on any pod
+                            can reach instance IMDS and steal this role
+          - pod exec role:  injected into every Fargate pod matching the selector
+        """
+        _ROLE_PROP: dict[ResourceType, str] = {
+            ResourceType.EKS_CLUSTER: "cluster_role_arn",
+            ResourceType.EKS_NODEGROUP: "node_role_arn",
+            ResourceType.EKS_FARGATE_PROFILE: "pod_execution_role_arn",
+        }
+        for resource in self.result.resources:
+            prop = _ROLE_PROP.get(resource.resource_type)
+            if not prop:
+                continue
+            role_arn = resource.properties.get(prop)
+            if role_arn:
+                self._ensure_node(role_arn, ResourceType.IAM_ROLE.value)
+                self.graph.add_edge(
+                    resource.arn,
+                    role_arn,
+                    edge_type=EdgeType.HAS_EXECUTION_ROLE,
+                    label=EdgeType.HAS_EXECUTION_ROLE.value,
+                )
+
+    # ──────────────────── EKS Membership Edges ────────────────────────────
+
+    def _add_eks_membership_edges(self) -> None:
+        """EKS cluster → nodegroup / Fargate profile."""
+        for resource in self.result.resources:
+            cluster_name: str | None = None
+            edge_type: EdgeType | None = None
+
+            if resource.resource_type == ResourceType.EKS_NODEGROUP:
+                cluster_name = resource.properties.get("cluster_name")
+                edge_type = EdgeType.HAS_NODE_GROUP
+            elif resource.resource_type == ResourceType.EKS_FARGATE_PROFILE:
+                cluster_name = resource.properties.get("cluster_name")
+                edge_type = EdgeType.HAS_FARGATE_PROFILE
+
+            if cluster_name and edge_type:
+                cluster_arn = self._eks_cluster_name_to_arn.get(cluster_name)
+                if cluster_arn:
+                    self.graph.add_edge(
+                        cluster_arn,
+                        resource.arn,
+                        edge_type=edge_type,
+                        label=edge_type.value,
+                    )
+
+    # ──────────────────── Encryption Edges ────────────────────────────────
+
+    def _add_encryption_edges(self) -> None:
+        """Resource → KMS key (encrypted_by) for every resource with kms_key_arn set."""
+        _ENCRYPTED_TYPES: set[ResourceType] = {
+            ResourceType.EKS_CLUSTER,
+            ResourceType.SECRETS_MANAGER_SECRET,
+            ResourceType.SSM_PARAMETER,
+            ResourceType.DYNAMODB_TABLE,
+            ResourceType.ELASTICACHE_CLUSTER,
+        }
+        for resource in self.result.resources:
+            if resource.resource_type not in _ENCRYPTED_TYPES:
+                continue
+            key_ref = resource.properties.get("kms_key_arn")
+            if not key_ref:
+                continue
+            key_arn = self._resolve_kms_key(key_ref)
+            if key_arn:
+                self._ensure_node(key_arn, ResourceType.KMS_KEY.value)
+                self.graph.add_edge(
+                    resource.arn,
+                    key_arn,
+                    edge_type=EdgeType.ENCRYPTED_BY,
+                    label=EdgeType.ENCRYPTED_BY.value,
+                )
+
+    def _resolve_kms_key(self, key_ref: str) -> str | None:
+        """Resolve a KMS key reference (ARN or bare key UUID) to a graph-usable ARN."""
+        if not key_ref:
+            return None
+        if key_ref.startswith("arn:") and ":key/" in key_ref:
+            return key_ref
+        if key_ref.startswith("arn:"):
+            return None  # alias ARN — can't resolve statically
+        if key_ref.startswith("alias/"):
+            return None
+        if key_ref in self._kms_key_id_to_arn:
+            return self._kms_key_id_to_arn[key_ref]
+        return None
 
     # ─────────────────────────── Helpers ──────────────────────────────────
 
