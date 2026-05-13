@@ -1,1 +1,4 @@
-"""Phase 5 — LLM attack-path reasoning. Not yet implemented."""
+from breakbot.brain.analyst import SecurityAnalyst
+from breakbot.brain.report import AnalysisReport, AttackPath
+
+__all__ = ["SecurityAnalyst", "AnalysisReport", "AttackPath"]
