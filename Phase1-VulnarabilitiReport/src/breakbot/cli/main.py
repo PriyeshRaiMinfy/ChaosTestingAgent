@@ -28,9 +28,10 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
-from breakbot.graph import GraphBuilder, GraphSerializer
+from breakbot.graph import GraphBuilder, GraphSerializer, TrailOverlay
 from breakbot.models import Resource, ScanResult
 from breakbot.posture import PostureAnalyzer
+from breakbot.scanner.cloudtrail import CloudTrailScanner, TrailEvent
 from breakbot.org import (
     DEFAULT_MEMBER_ROLE,
     CrossAccountSessionFactory,
@@ -200,6 +201,16 @@ def scan(
             "apigateway, cdn, serverless"
         ),
     ),
+    trail: bool = typer.Option(
+        False, "--trail",
+        help="Also fetch CloudTrail behavioral events (last 90 days). "
+             "Writes trail.json alongside scan.json. No extra AWS cost — "
+             "uses management events only.",
+    ),
+    trail_days: int = typer.Option(
+        90, "--trail-days",
+        help="How many days of CloudTrail history to fetch (max 90).",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
 ):
     """Run a full read-only scan of one account, or every account in the Organization."""
@@ -338,6 +349,20 @@ def scan(
     console.print(
         f"[green]✔[/green] Posture findings written to [bold]{scan_dir / 'posture.json'}[/bold]"
     )
+
+    # CloudTrail behavioral overlay (optional — only when --trail is set)
+    if trail:
+        console.print("\n[bold]Fetching CloudTrail behavioral events...[/bold]")
+        trail_scanner = CloudTrailScanner()
+        days = min(trail_days, 90)
+        # Use the master session for trail (org mode: trail is in management/audit account)
+        trail_events = trail_scanner.scan(master, regions_seen, lookback_days=days)
+        trail_dicts = [e.to_dict() for e in trail_events]
+        (scan_dir / "trail.json").write_text(json.dumps(trail_dicts, indent=2))
+        console.print(
+            f"[green]✔[/green] {len(trail_events)} behavioral event(s) written to "
+            f"[bold]{scan_dir / 'trail.json'}[/bold]"
+        )
 
     console.print(f"\n[green]✔[/green] Written to [bold]{scan_dir}[/bold]")
 
@@ -478,6 +503,23 @@ def graph(
     console.print("[bold]Building dependency graph...[/bold]")
     builder = GraphBuilder(result)
     g = builder.build()
+
+    # Apply CloudTrail behavioral overlay if trail.json exists alongside scan.json
+    trail_file = scan_dir / "trail.json"
+    if trail_file.exists():
+        console.print("[bold]Applying CloudTrail behavioral overlay...[/bold]")
+        raw_events = json.loads(trail_file.read_text())
+        trail_events = [TrailEvent.from_dict(e) for e in raw_events]
+        behavioral_edges = TrailOverlay().apply(g, builder.arn_index, trail_events)
+        console.print(
+            f"[green]✔[/green] {behavioral_edges} behavioral edge(s) added "
+            f"from {len(trail_events)} CloudTrail event(s)"
+        )
+    else:
+        console.print(
+            "[dim]No trail.json found — run `breakbot scan --trail` to add "
+            "behavioral edges.[/dim]"
+        )
 
     serializer = GraphSerializer(g, builder.arn_index, max_hops=max_hops)
     stats = serializer.stats()
