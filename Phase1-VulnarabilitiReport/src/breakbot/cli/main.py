@@ -636,5 +636,117 @@ def posture(
             )
 
 
+@app.command()
+def report(
+    scan_dir: Path = typer.Argument(..., help="Path to a scan output directory (e.g. scans/scan-...)"),
+    format: str = typer.Option(
+        "md", "--format", "-f",
+        help="Output format: md (Markdown), json, or html",
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o",
+        help="Write report to this file. Defaults to report.md / report.json in the scan dir.",
+    ),
+    max_hops: int = typer.Option(5, "--max-hops", help="Max path length for attack surface graph"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Generate an LLM-powered attack-path report from a completed scan.
+
+    Requires the 'anthropic' package: pip install 'breakbot[llm]'
+    Set ANTHROPIC_API_KEY in your environment before running.
+    """
+    _configure_logging(verbose)
+
+    scan_file = scan_dir / "scan.json"
+    posture_file = scan_dir / "posture.json"
+
+    if not scan_file.exists():
+        console.print(f"[red]No scan.json found in {scan_dir}[/red]")
+        raise typer.Exit(1)
+
+    fmt = format.lower().strip()
+    if fmt not in {"md", "json", "html"}:
+        console.print(f"[red]Unknown format '{format}' — use md, json, or html[/red]")
+        raise typer.Exit(1)
+
+    # Load scan and build graph serialization
+    console.print(f"Loading scan from [bold]{scan_file}[/bold]")
+    result = ScanResult.model_validate_json(scan_file.read_text())
+    console.print(
+        f"Loaded {result.resource_count} resources across "
+        f"[yellow]{len(result.accounts_scanned)}[/yellow] account(s)"
+    )
+
+    console.print("[bold]Building dependency graph...[/bold]")
+    builder = GraphBuilder(result)
+    g = builder.build()
+
+    trail_file = scan_dir / "trail.json"
+    if trail_file.exists():
+        console.print("[bold]Applying CloudTrail behavioral overlay...[/bold]")
+        raw_events = json.loads(trail_file.read_text())
+        trail_events = [TrailEvent.from_dict(e) for e in raw_events]
+        behavioral_edges = TrailOverlay().apply(g, builder.arn_index, trail_events)
+        console.print(f"[green]✔[/green] {behavioral_edges} behavioral edge(s) added")
+
+    from breakbot.graph import GraphSerializer
+    serializer = GraphSerializer(g, builder.arn_index, max_hops=max_hops)
+    attack_surface = serializer.serialize()
+
+    # Load posture findings
+    posture_findings: list[dict] = []
+    if posture_file.exists():
+        posture_findings = json.loads(posture_file.read_text())
+        console.print(f"Loaded [yellow]{len(posture_findings)}[/yellow] posture finding(s)")
+    else:
+        console.print("[yellow]No posture.json found — run 'breakbot posture' first[/yellow]")
+
+    # Call Claude
+    try:
+        from breakbot.brain import SecurityAnalyst
+    except ImportError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+    console.print(f"\n[bold]Calling Claude (claude-opus-4-7) for threat analysis...[/bold]")
+    analyst = SecurityAnalyst()
+    analysis = analyst.analyze(attack_surface, posture_findings)
+
+    # Determine output path
+    ext_map = {"md": ".md", "json": ".json", "html": ".html"}
+    dest = output or (scan_dir / f"report{ext_map[fmt]}")
+
+    if fmt == "json":
+        dest.write_text(analysis.to_json(), encoding="utf-8")
+    elif fmt == "html":
+        dest.write_text(_report_to_html(analysis), encoding="utf-8")
+    else:
+        dest.write_text(analysis.to_markdown(), encoding="utf-8")
+
+    console.print(f"\n[green]✔[/green] Report written to [bold]{dest}[/bold]")
+    console.print(f"Overall severity: [bold red]{analysis.overall_severity}[/bold red]")
+    console.print(f"Attack paths identified: [bold]{len(analysis.attack_paths)}[/bold]")
+
+
+def _report_to_html(analysis: object) -> str:
+    """Minimal HTML wrapper around the Markdown report."""
+    import html as html_lib
+    from breakbot.brain.report import AnalysisReport
+
+    assert isinstance(analysis, AnalysisReport)
+    md = analysis.to_markdown()
+    escaped = html_lib.escape(md)
+    return (
+        "<!DOCTYPE html><html><head>"
+        "<meta charset='utf-8'>"
+        "<title>BreakBot Report</title>"
+        "<style>body{font-family:monospace;max-width:900px;margin:2em auto;padding:0 1em;"
+        "white-space:pre-wrap;line-height:1.5}</style>"
+        "</head><body>"
+        + escaped
+        + "</body></html>"
+    )
+
+
 if __name__ == "__main__":
     app()
