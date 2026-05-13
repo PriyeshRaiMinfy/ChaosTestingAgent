@@ -192,6 +192,17 @@ class GraphBuilder:
                         label=EdgeType.HAS_EXECUTION_ROLE.value,
                     )
 
+            elif resource.resource_type == ResourceType.ECS_TASK_DEFINITION:
+                task_role_arn = resource.properties.get("task_role_arn")
+                if task_role_arn:
+                    self._ensure_node(task_role_arn, ResourceType.IAM_ROLE.value)
+                    self.graph.add_edge(
+                        resource.arn,
+                        task_role_arn,
+                        edge_type=EdgeType.HAS_EXECUTION_ROLE,
+                        label=EdgeType.HAS_EXECUTION_ROLE.value,
+                    )
+
             elif resource.resource_type == ResourceType.EC2_INSTANCE:
                 profile_arn = resource.properties.get("iam_instance_profile_arn")
                 if not profile_arn:
@@ -233,6 +244,8 @@ class GraphBuilder:
             ResourceType.ALB: "security_group_ids",
             ResourceType.EKS_CLUSTER: "security_group_ids",
             ResourceType.ELASTICACHE_CLUSTER: "security_group_ids",
+            ResourceType.ECS_SERVICE: "security_group_ids",   # awsvpc network mode
+            ResourceType.MSK_CLUSTER: "security_group_ids",
         }
 
         for resource in self.result.resources:
@@ -389,12 +402,14 @@ class GraphBuilder:
     # ──────────────────── VPC Membership Edges ────────────────────────────
 
     def _add_vpc_membership_edges(self) -> None:
-        """Lambda, RDS, EC2, and EKS clusters → VPC when their vpc_id is known."""
+        """Resources with a vpc_id property → VPC when the VPC is in the scan."""
         _VPC_TYPES = {
             ResourceType.LAMBDA_FUNCTION,
             ResourceType.RDS_INSTANCE,
             ResourceType.EC2_INSTANCE,
             ResourceType.EKS_CLUSTER,
+            ResourceType.NAT_GATEWAY,
+            ResourceType.INTERNET_GATEWAY,
         }
         for resource in self.result.resources:
             if resource.resource_type not in _VPC_TYPES:
@@ -477,6 +492,10 @@ class GraphBuilder:
             ResourceType.SSM_PARAMETER,
             ResourceType.DYNAMODB_TABLE,
             ResourceType.ELASTICACHE_CLUSTER,
+            ResourceType.SQS_QUEUE,
+            ResourceType.SNS_TOPIC,
+            ResourceType.MSK_CLUSTER,
+            ResourceType.KINESIS_STREAM,
         }
         for resource in self.result.resources:
             if resource.resource_type not in _ENCRYPTED_TYPES:
