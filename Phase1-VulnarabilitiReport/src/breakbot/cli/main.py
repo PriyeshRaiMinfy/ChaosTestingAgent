@@ -35,12 +35,17 @@ from breakbot.org import (
     OrganizationScanner,
 )
 from breakbot.scanner import (
+    CognitoScanner,
     ComputeScanner,
     DataScanner,
+    DnsScanner,
+    EcsScanner,
     EksScanner,
     IdentityScanner,
+    MessagingScanner,
     NetworkingScanner,
     SecretsScanner,
+    WafScanner,
 )
 from breakbot.utils import AWSSession
 
@@ -58,6 +63,11 @@ SCANNER_REGISTRY = {
     "identity": IdentityScanner,
     "eks": EksScanner,
     "secrets": SecretsScanner,
+    "containers": EcsScanner,
+    "messaging": MessagingScanner,
+    "waf": WafScanner,
+    "dns": DnsScanner,
+    "cognito": CognitoScanner,
 }
 
 
@@ -176,7 +186,10 @@ def scan(
     domains: list[str] = typer.Option(
         None,
         "--domain", "-d",
-        help="Restrict to specific domains: compute, networking, data, identity, eks, secrets",
+        help=(
+            "Restrict to specific domains: compute, networking, data, identity, "
+            "eks, secrets, containers, messaging, waf, dns, cognito"
+        ),
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
 ):

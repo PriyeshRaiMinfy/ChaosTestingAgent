@@ -1,5 +1,5 @@
 """
-Networking scanner — VPCs, subnets, security groups, ALBs.
+Networking scanner — VPCs, security groups, ALBs, NAT Gateways, Internet Gateways.
 
 Security group ingress rules are the most important output here. They become
 `network_can_reach` edges in the graph. We capture them as structured rule
@@ -9,6 +9,11 @@ references without re-parsing AWS-shaped JSON.
 ALBs matter because they're the most common internet-facing entry point.
 A public ALB pointing at a Lambda or EC2 target is the start of many attack
 chains.
+
+NAT Gateways show which private subnets have outbound internet access — relevant
+for data-exfiltration paths.
+
+Internet Gateways mark which VPCs have direct two-way internet connectivity.
 """
 from __future__ import annotations
 
@@ -33,6 +38,8 @@ class NetworkingScanner(BaseScanner):
         resources.extend(self._scan_vpcs(region))
         resources.extend(self._scan_security_groups(region))
         resources.extend(self._scan_albs(region))
+        resources.extend(self._scan_nat_gateways(region))
+        resources.extend(self._scan_internet_gateways(region))
         return resources
 
     # ──────────────────────────── VPCs ──────────────────────────────────
@@ -171,5 +178,94 @@ class NetworkingScanner(BaseScanner):
             name=name,
             region=region,
             account_id=self.session.account_id,
+            properties=properties,
+        )
+
+    # ─────────────────────── NAT Gateways ─────────────────────────────────
+
+    def _scan_nat_gateways(self, region: str) -> list[Resource]:
+        ec2 = self.session.client("ec2", region=region)
+        paginator = ec2.get_paginator("describe_nat_gateways")
+        resources: list[Resource] = []
+        try:
+            for page in paginator.paginate(
+                Filter=[{"Name": "state", "Values": ["available", "pending"]}]
+            ):
+                for ngw in page.get("NatGateways", []):
+                    resources.append(self._normalize_nat_gateway(ngw, region))
+        except ClientError as e:
+            logger.warning(
+                "NAT Gateway scan failed in %s: %s", region, e.response["Error"]["Code"]
+            )
+        return resources
+
+    def _normalize_nat_gateway(self, ngw: dict, region: str) -> Resource:
+        ngw_id = ngw["NatGatewayId"]
+        arn = f"arn:aws:ec2:{region}:{self.session.account_id}:natgateway/{ngw_id}"
+        tags = {t["Key"]: t["Value"] for t in ngw.get("Tags", [])}
+        public_ips = [
+            addr["PublicIp"]
+            for addr in ngw.get("NatGatewayAddresses", [])
+            if addr.get("PublicIp")
+        ]
+
+        properties = {
+            "nat_gateway_id": ngw_id,
+            "state": ngw.get("State"),
+            "connectivity_type": ngw.get("ConnectivityType", "public"),
+            "vpc_id": ngw.get("VpcId"),
+            "subnet_id": ngw.get("SubnetId"),
+            "public_ips": public_ips,
+        }
+
+        return Resource(
+            arn=arn,
+            resource_type=ResourceType.NAT_GATEWAY,
+            name=tags.get("Name", ngw_id),
+            region=region,
+            account_id=self.session.account_id,
+            tags=tags,
+            properties=properties,
+        )
+
+    # ──────────────────── Internet Gateways ───────────────────────────────
+
+    def _scan_internet_gateways(self, region: str) -> list[Resource]:
+        ec2 = self.session.client("ec2", region=region)
+        paginator = ec2.get_paginator("describe_internet_gateways")
+        resources: list[Resource] = []
+        try:
+            for page in paginator.paginate():
+                for igw in page.get("InternetGateways", []):
+                    resources.append(self._normalize_internet_gateway(igw, region))
+        except ClientError as e:
+            logger.warning(
+                "IGW scan failed in %s: %s", region, e.response["Error"]["Code"]
+            )
+        return resources
+
+    def _normalize_internet_gateway(self, igw: dict, region: str) -> Resource:
+        igw_id = igw["InternetGatewayId"]
+        arn = f"arn:aws:ec2:{region}:{self.session.account_id}:internet-gateway/{igw_id}"
+        tags = {t["Key"]: t["Value"] for t in igw.get("Tags", [])}
+
+        attachments = igw.get("Attachments", [])
+        attached_vpc_ids = [a["VpcId"] for a in attachments if a.get("State") == "available"]
+
+        properties = {
+            "internet_gateway_id": igw_id,
+            "attached_vpc_ids": attached_vpc_ids,
+            "is_attached": bool(attached_vpc_ids),
+            # Store first VPC so the builder's in_vpc logic picks it up
+            "vpc_id": attached_vpc_ids[0] if attached_vpc_ids else None,
+        }
+
+        return Resource(
+            arn=arn,
+            resource_type=ResourceType.INTERNET_GATEWAY,
+            name=tags.get("Name", igw_id),
+            region=region,
+            account_id=self.session.account_id,
+            tags=tags,
             properties=properties,
         )

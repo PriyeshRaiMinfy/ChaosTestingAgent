@@ -32,6 +32,15 @@ class ResourceType(str, Enum):
     RDS_INSTANCE = "rds:db-instance"
     DYNAMODB_TABLE = "dynamodb:table"
     ELASTICACHE_CLUSTER = "elasticache:cluster"
+    # Containers
+    ECS_CLUSTER = "ecs:cluster"
+    ECS_SERVICE = "ecs:service"
+    ECS_TASK_DEFINITION = "ecs:task-definition"
+    # Messaging and streaming
+    SQS_QUEUE = "sqs:queue"
+    SNS_TOPIC = "sns:topic"
+    MSK_CLUSTER = "msk:cluster"
+    KINESIS_STREAM = "kinesis:stream"
     # Secrets and key management
     SECRETS_MANAGER_SECRET = "secretsmanager:secret"
     SSM_PARAMETER = "ssm:parameter"
@@ -40,6 +49,14 @@ class ResourceType(str, Enum):
     IAM_ROLE = "iam:role"
     IAM_POLICY = "iam:policy"
     IAM_USER = "iam:user"
+    COGNITO_USER_POOL = "cognito-idp:user-pool"
+    # Security
+    WAF_WEB_ACL = "wafv2:web-acl"
+    # Extended networking
+    NAT_GATEWAY = "ec2:nat-gateway"
+    INTERNET_GATEWAY = "ec2:internet-gateway"
+    # DNS
+    ROUTE53_HOSTED_ZONE = "route53:hosted-zone"
 
 
 class Resource(BaseModel):
