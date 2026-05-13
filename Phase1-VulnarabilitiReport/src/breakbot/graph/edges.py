@@ -23,8 +23,13 @@ class EdgeType(str, Enum):
 
     # Structural / membership edges
     IN_VPC = "in_vpc"
-    HAS_NODE_GROUP = "has_node_group"          # EKS cluster → managed node group
-    HAS_FARGATE_PROFILE = "has_fargate_profile"  # EKS cluster → Fargate profile
+    HAS_NODE_GROUP = "has_node_group"              # EKS cluster → managed node group
+    HAS_FARGATE_PROFILE = "has_fargate_profile"    # EKS cluster → Fargate profile
+    HAS_TARGET_GROUP = "has_target_group"          # ALB/NLB → target group
+    ROUTES_TO = "routes_to"                        # EventBridge rule → target resource
+
+    # Security posture edges
+    PROTECTED_BY_WAF = "protected_by_waf"          # CloudFront/API GW → WAF web ACL
 
     # Encryption edges
     ENCRYPTED_BY = "encrypted_by"  # resource → KMS key
