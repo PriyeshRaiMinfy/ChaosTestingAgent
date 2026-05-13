@@ -18,14 +18,24 @@ class ResourceType(str, Enum):
     # Compute
     EC2_INSTANCE = "ec2:instance"
     LAMBDA_FUNCTION = "lambda:function"
+    # Container orchestration
+    EKS_CLUSTER = "eks:cluster"
+    EKS_NODEGROUP = "eks:nodegroup"
+    EKS_FARGATE_PROFILE = "eks:fargate-profile"
     # Networking
     VPC = "ec2:vpc"
     SUBNET = "ec2:subnet"
     SECURITY_GROUP = "ec2:security-group"
     ALB = "elbv2:load-balancer"
-    # Data
+    # Data stores
     S3_BUCKET = "s3:bucket"
     RDS_INSTANCE = "rds:db-instance"
+    DYNAMODB_TABLE = "dynamodb:table"
+    ELASTICACHE_CLUSTER = "elasticache:cluster"
+    # Secrets and key management
+    SECRETS_MANAGER_SECRET = "secretsmanager:secret"
+    SSM_PARAMETER = "ssm:parameter"
+    KMS_KEY = "kms:key"
     # Identity
     IAM_ROLE = "iam:role"
     IAM_POLICY = "iam:policy"
