@@ -37,6 +37,8 @@ from breakbot.org import (
     OrganizationScanner,
 )
 from breakbot.scanner import (
+    ApiGatewayScanner,
+    CloudFrontScanner,
     CognitoScanner,
     ComputeScanner,
     DataScanner,
@@ -47,6 +49,7 @@ from breakbot.scanner import (
     MessagingScanner,
     NetworkingScanner,
     SecretsScanner,
+    ServerlessScanner,
     WafScanner,
 )
 from breakbot.utils import AWSSession
@@ -70,6 +73,9 @@ SCANNER_REGISTRY = {
     "waf": WafScanner,
     "dns": DnsScanner,
     "cognito": CognitoScanner,
+    "apigateway": ApiGatewayScanner,
+    "cdn": CloudFrontScanner,
+    "serverless": ServerlessScanner,
 }
 
 
@@ -190,7 +196,8 @@ def scan(
         "--domain", "-d",
         help=(
             "Restrict to specific domains: compute, networking, data, identity, "
-            "eks, secrets, containers, messaging, waf, dns, cognito"
+            "eks, secrets, containers, messaging, waf, dns, cognito, "
+            "apigateway, cdn, serverless"
         ),
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),

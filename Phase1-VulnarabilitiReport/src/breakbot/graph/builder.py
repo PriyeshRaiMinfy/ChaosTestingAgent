@@ -7,19 +7,21 @@ Relationships between resources become typed directed edges.
 Edge types built here (static graph only — behavioral edges from CloudTrail
 are added in Phase 3 overlay step):
 
-  iam_can_assume       Trust policy Principal         →  IAM Role
-  has_execution_role   Lambda / EKS cluster/nodegroup →  IAM Role
-  has_instance_profile EC2                            →  IAM Role (best-effort name match)
-  iam_can_access       IAM Role                       →  Resource
-  attached_to_sg       EC2 / Lambda / RDS / ALB /
-                       EKS cluster / ElastiCache       →  SecurityGroup
-  network_can_reach    SecurityGroup                  →  SecurityGroup (ingress SG ref)
-  internet_exposes     INTERNET (virtual)             →  SecurityGroup (0.0.0.0/0 ingress)
-  in_vpc               Lambda / RDS / EC2 / EKS       →  VPC
-  has_node_group       EKS cluster                    →  EKS nodegroup
-  has_fargate_profile  EKS cluster                    →  EKS Fargate profile
-  encrypted_by         Secret / Param / DynamoDB /
-                       ElastiCache / EKS cluster       →  KMS key
+  iam_can_assume       Trust policy Principal                →  IAM Role
+  has_execution_role   Lambda / EKS / ECS / Step Functions  →  IAM Role
+  has_instance_profile EC2                                  →  IAM Role
+  iam_can_access       IAM Role                             →  Resource
+  attached_to_sg       EC2 / Lambda / RDS / ALB / EKS /
+                       ElastiCache / ECS / MSK               →  SecurityGroup
+  network_can_reach    SecurityGroup                        →  SecurityGroup (ingress ref)
+  internet_exposes     INTERNET (virtual)                   →  SecurityGroup (0.0.0.0/0)
+  in_vpc               Lambda / RDS / EC2 / EKS / NAT / IGW →  VPC
+  has_node_group       EKS cluster                          →  EKS nodegroup
+  has_fargate_profile  EKS cluster                          →  EKS Fargate profile
+  has_target_group     ALB / NLB                            →  Target Group
+  protected_by_waf     CloudFront / API GW stage            →  WAF Web ACL
+  routes_to            EventBridge rule                     →  target resource
+  encrypted_by         Secret / Param / DynamoDB / …        →  KMS key
 """
 from __future__ import annotations
 
@@ -53,6 +55,7 @@ class GraphBuilder:
         self._vpc_id_to_arn: dict[str, str] = {}            # vpc-xxxxxx → ARN
         self._eks_cluster_name_to_arn: dict[str, str] = {}  # cluster name → ARN
         self._kms_key_id_to_arn: dict[str, str] = {}        # key UUID → ARN
+        self._waf_arn_index: set[str] = set()               # all known WAF web ACL ARNs
 
     @property
     def arn_index(self) -> dict[str, Resource]:
@@ -73,6 +76,10 @@ class GraphBuilder:
         self._add_iam_policy_access_edges()
         self._add_vpc_membership_edges()
         self._add_encryption_edges()
+        self._add_target_group_edges()
+        self._add_waf_protection_edges()
+        self._add_eventbridge_target_edges()
+        self._add_step_functions_role_edges()
 
         logger.info(
             "Graph built: %d nodes, %d edges",
@@ -112,6 +119,9 @@ class GraphBuilder:
                 key_id = resource.properties.get("key_id")
                 if key_id:
                     self._kms_key_id_to_arn[key_id] = resource.arn
+
+            elif resource.resource_type == ResourceType.WAF_WEB_ACL:
+                self._waf_arn_index.add(resource.arn)
 
     # ─────────────────────────── Nodes ────────────────────────────────────
 
@@ -511,6 +521,113 @@ class GraphBuilder:
                     key_arn,
                     edge_type=EdgeType.ENCRYPTED_BY,
                     label=EdgeType.ENCRYPTED_BY.value,
+                )
+
+    # ─────────────── Target Group Edges (ALB/NLB → Target Group) ─────────
+
+    def _add_target_group_edges(self) -> None:
+        """ALB/NLB → Target Group when the TG lists the LB in its lb_arns."""
+        for resource in self.result.resources:
+            if resource.resource_type != ResourceType.LOAD_BALANCER_TARGET_GROUP:
+                continue
+            for lb_arn in resource.properties.get("lb_arns", []):
+                if lb_arn in self._arn_index:
+                    self.graph.add_edge(
+                        lb_arn,
+                        resource.arn,
+                        edge_type=EdgeType.HAS_TARGET_GROUP,
+                        label=EdgeType.HAS_TARGET_GROUP.value,
+                    )
+
+    # ─────────────── WAF Protection Edges ─────────────────────────────────
+
+    def _add_waf_protection_edges(self) -> None:
+        """
+        CloudFront distribution → WAF web ACL  (protected_by_waf)
+        API Gateway REST API stage → WAF web ACL  (protected_by_waf)
+
+        Attack path meaning: a finding on the WAF (e.g. allow-mode or no rules)
+        propagates risk to every resource it is meant to protect.
+        """
+        for resource in self.result.resources:
+            if resource.resource_type == ResourceType.CLOUDFRONT_DISTRIBUTION:
+                waf_id = resource.properties.get("web_acl_id", "")
+                if waf_id:
+                    # CloudFront uses WAFv1 IDs (bare UUIDs) or WAFv2 ARNs
+                    target = waf_id if waf_id in self._arn_index else None
+                    if not target:
+                        # Try matching by partial ARN suffix (WAFv2 uses full ARNs)
+                        for waf_arn in self._waf_arn_index:
+                            if waf_arn.endswith(waf_id) or waf_id in waf_arn:
+                                target = waf_arn
+                                break
+                    if target:
+                        self._ensure_node(target, ResourceType.WAF_WEB_ACL.value)
+                        self.graph.add_edge(
+                            resource.arn,
+                            target,
+                            edge_type=EdgeType.PROTECTED_BY_WAF,
+                            label=EdgeType.PROTECTED_BY_WAF.value,
+                        )
+
+            elif resource.resource_type == ResourceType.API_GATEWAY_REST_API:
+                for stage_waf_arn in resource.properties.get("stage_waf_arns", []):
+                    if stage_waf_arn:
+                        self._ensure_node(stage_waf_arn, ResourceType.WAF_WEB_ACL.value)
+                        self.graph.add_edge(
+                            resource.arn,
+                            stage_waf_arn,
+                            edge_type=EdgeType.PROTECTED_BY_WAF,
+                            label=EdgeType.PROTECTED_BY_WAF.value,
+                        )
+
+    # ──────────────── EventBridge Target Edges ─────────────────────────────
+
+    def _add_eventbridge_target_edges(self) -> None:
+        """EventBridge rule → target resource (routes_to) when the target ARN is in the graph."""
+        for resource in self.result.resources:
+            if resource.resource_type != ResourceType.EVENTBRIDGE_RULE:
+                continue
+            for target in resource.properties.get("targets", []):
+                t_arn = target.get("arn", "")
+                if not t_arn:
+                    continue
+                # Only add edge if the target is a known scanned resource
+                resolved = self._resolve_resource_arn(t_arn)
+                if resolved in self._arn_index:
+                    self.graph.add_edge(
+                        resource.arn,
+                        resolved,
+                        edge_type=EdgeType.ROUTES_TO,
+                        label=EdgeType.ROUTES_TO.value,
+                        is_cross_account=target.get("is_cross_account", False),
+                    )
+                # Also add IAM role edge when EventBridge assumes a role to deliver
+                role_arn = target.get("role_arn", "")
+                if role_arn:
+                    self._ensure_node(role_arn, ResourceType.IAM_ROLE.value)
+                    self.graph.add_edge(
+                        resource.arn,
+                        role_arn,
+                        edge_type=EdgeType.HAS_EXECUTION_ROLE,
+                        label=EdgeType.HAS_EXECUTION_ROLE.value,
+                    )
+
+    # ──────────────── Step Functions Role Edges ────────────────────────────
+
+    def _add_step_functions_role_edges(self) -> None:
+        """Step Functions state machine → IAM role (has_execution_role)."""
+        for resource in self.result.resources:
+            if resource.resource_type != ResourceType.STEP_FUNCTIONS_STATE_MACHINE:
+                continue
+            role_arn = resource.properties.get("role_arn")
+            if role_arn:
+                self._ensure_node(role_arn, ResourceType.IAM_ROLE.value)
+                self.graph.add_edge(
+                    resource.arn,
+                    role_arn,
+                    edge_type=EdgeType.HAS_EXECUTION_ROLE,
+                    label=EdgeType.HAS_EXECUTION_ROLE.value,
                 )
 
     def _resolve_kms_key(self, key_ref: str) -> str | None:

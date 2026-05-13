@@ -55,8 +55,17 @@ class ResourceType(str, Enum):
     # Extended networking
     NAT_GATEWAY = "ec2:nat-gateway"
     INTERNET_GATEWAY = "ec2:internet-gateway"
+    LOAD_BALANCER_TARGET_GROUP = "elbv2:target-group"
     # DNS
     ROUTE53_HOSTED_ZONE = "route53:hosted-zone"
+    # API Gateway
+    API_GATEWAY_REST_API = "apigateway:rest-api"
+    API_GATEWAY_HTTP_API = "apigatewayv2:http-api"
+    # CDN
+    CLOUDFRONT_DISTRIBUTION = "cloudfront:distribution"
+    # Serverless orchestration
+    EVENTBRIDGE_RULE = "events:rule"
+    STEP_FUNCTIONS_STATE_MACHINE = "states:state-machine"
 
 
 class Resource(BaseModel):
