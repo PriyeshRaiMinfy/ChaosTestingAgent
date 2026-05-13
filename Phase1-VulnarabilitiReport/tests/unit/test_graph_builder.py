@@ -20,7 +20,8 @@ from breakbot.models import Resource, ResourceType, ScanResult
 def _result(*resources: Resource) -> ScanResult:
     return ScanResult(
         scan_id="test-scan",
-        account_id="123456789012",
+        scanner_account_id="123456789012",
+        accounts_scanned=["123456789012"],
         started_at=datetime(2025, 1, 1),
         completed_at=datetime(2025, 1, 1),
         regions_scanned=["us-east-1"],

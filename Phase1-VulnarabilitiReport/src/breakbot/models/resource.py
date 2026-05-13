@@ -60,7 +60,15 @@ class Resource(BaseModel):
 class ScanResult(BaseModel):
     """A scan's complete output — what gets serialized to JSON on disk."""
     scan_id: str
-    account_id: str
+    scanner_account_id: str = Field(
+        ...,
+        description="Account BreakBot ran from. In org mode this is the Audit account; "
+                    "in single-account mode it equals the only entry in accounts_scanned.",
+    )
+    accounts_scanned: list[str] = Field(
+        ...,
+        description="Every account whose resources are included in this scan.",
+    )
     started_at: datetime
     completed_at: datetime | None = None
     regions_scanned: list[str]
@@ -70,3 +78,7 @@ class ScanResult(BaseModel):
     @property
     def resource_count(self) -> int:
         return len(self.resources)
+
+    @property
+    def is_org_scan(self) -> bool:
+        return len(self.accounts_scanned) > 1
