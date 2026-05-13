@@ -34,6 +34,10 @@ class EdgeType(str, Enum):
     # Encryption edges
     ENCRYPTED_BY = "encrypted_by"  # resource → KMS key
 
+    # Behavioral edges (CloudTrail-derived — Phase 3-trail)
+    ACTUALLY_ASSUMED = "actually_assumed"    # Principal → IAM Role (AssumeRole was called)
+    ACTUALLY_ACCESSED = "actually_accessed"  # Actor → Resource (GetSecretValue/Decrypt/GetParameter)
+
 
 # Synthetic node IDs — not real AWS ARNs, but useful anchors in the graph.
 INTERNET_NODE_ID = "INTERNET"
