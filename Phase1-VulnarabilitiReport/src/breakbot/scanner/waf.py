@@ -1,13 +1,6 @@
 """
 WAF scanner — WAFv2 web ACLs (REGIONAL and CLOUDFRONT scope).
 
-Key properties:
-  - default_action = Allow  → WAF is in observation mode, not blocking
-  - rule_count = 0          → WAF exists but has no rules (useless)
-  - cloudwatch_metrics_enabled = False → no visibility into blocked requests
-  - scope = CLOUDFRONT      → protects a CloudFront distribution (global)
-  - scope = REGIONAL        → protects ALBs, API Gateways, AppSync in this region
-
 CLOUDFRONT-scoped WAFs must be fetched from us-east-1 regardless of the
 scan region. We scan them once using the `_cloudfront_scanned` flag.
 """
@@ -32,11 +25,17 @@ class WafScanner(BaseScanner):
 
     def _scan_region(self, region: str) -> list[Resource]:
         resources: list[Resource] = []
-        resources.extend(self._scan_scope(region, "REGIONAL"))
+        resources.extend(self._safe_scan_call(
+            "wafv2", "list_web_acls(REGIONAL)", region,
+            lambda: self._scan_scope(region, "REGIONAL"),
+        ))
         # CLOUDFRONT scope must be fetched from us-east-1 exactly once
         if region == "us-east-1" and not self._cloudfront_scanned:
             self._cloudfront_scanned = True
-            resources.extend(self._scan_scope(region, "CLOUDFRONT"))
+            resources.extend(self._safe_scan_call(
+                "wafv2", "list_web_acls(CLOUDFRONT)", region,
+                lambda: self._scan_scope(region, "CLOUDFRONT"),
+            ))
         return resources
 
     def _scan_scope(self, region: str, scope: str) -> list[Resource]:
@@ -44,37 +43,30 @@ class WafScanner(BaseScanner):
         resources: list[Resource] = []
         acl_summaries: list[dict] = []
 
-        try:
-            # WAFv2 uses NextMarker pagination (no boto3 paginator)
-            resp = wafv2.list_web_acls(Scope=scope, Limit=100)
+        # WAFv2 uses NextMarker pagination (no boto3 paginator)
+        resp = wafv2.list_web_acls(Scope=scope, Limit=100)
+        acl_summaries.extend(resp.get("WebACLs", []))
+        while resp.get("NextMarker"):
+            resp = wafv2.list_web_acls(
+                Scope=scope, Limit=100, NextMarker=resp["NextMarker"]
+            )
             acl_summaries.extend(resp.get("WebACLs", []))
-            while resp.get("NextMarker"):
-                resp = wafv2.list_web_acls(
-                    Scope=scope, Limit=100, NextMarker=resp["NextMarker"]
-                )
-                acl_summaries.extend(resp.get("WebACLs", []))
-        except ClientError as e:
-            code = e.response["Error"]["Code"]
-            # Some regions don't support WAFv2 at all
-            if code not in ("WAFInvalidOperationException", "WAFNonexistentItemException"):
-                logger.warning(
-                    "WAF ListWebACLs (%s) failed in %s: %s", scope, region, code
-                )
-            return resources
 
         for summary in acl_summaries:
             try:
                 resp = wafv2.get_web_acl(
                     Name=summary["Name"], Scope=scope, Id=summary["Id"]
                 )
-                resources.append(
-                    self._normalize_web_acl(resp["WebACL"], region, scope)
-                )
+                resources.append(self._normalize_web_acl(resp["WebACL"], region, scope))
             except ClientError as e:
                 logger.warning(
                     "WAF GetWebACL %s failed: %s",
-                    summary["Name"],
-                    e.response["Error"]["Code"],
+                    summary["Name"], e.response["Error"]["Code"],
+                )
+            except Exception as e:
+                logger.warning(
+                    "[waf] failed to normalize web ACL %s: %s",
+                    summary.get("Name", "?"), e,
                 )
 
         return resources

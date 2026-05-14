@@ -1,24 +1,5 @@
 """
 API Gateway scanner — REST APIs (v1) and HTTP/WebSocket APIs (v2).
-
-Key attack-path properties:
-  REST API:
-    - auth_type = NONE on any method  → unauthenticated endpoint
-    - endpoint_type = EDGE            → routed through CloudFront globally
-    - endpoint_type = PRIVATE         → only accessible from within VPCs
-    - stage_waf_arns                  → which stages have WAF coverage
-    - has_api_key_required            → API key as auth (weak)
-
-  HTTP API (v2):
-    - protocol_type = WEBSOCKET       → bi-directional channel
-    - has_authorizer                  → JWT/Lambda authorizer present
-    - cors_allow_origins = ["*"]      → any origin can call the API
-
-REST API ARN format:
-  arn:aws:execute-api:{region}:{account_id}:{api_id}
-
-HTTP API ARN format:
-  arn:aws:apigateway:{region}::/apis/{api_id}
 """
 from __future__ import annotations
 
@@ -37,8 +18,14 @@ class ApiGatewayScanner(BaseScanner):
 
     def _scan_region(self, region: str) -> list[Resource]:
         resources: list[Resource] = []
-        resources.extend(self._scan_rest_apis(region))
-        resources.extend(self._scan_http_apis(region))
+        resources.extend(self._safe_scan_call(
+            "apigateway", "get_rest_apis", region,
+            lambda: self._scan_rest_apis(region),
+        ))
+        resources.extend(self._safe_scan_call(
+            "apigatewayv2", "get_apis", region,
+            lambda: self._scan_http_apis(region),
+        ))
         return resources
 
     # ─────────────────────── REST APIs (v1) ───────────────────────────────
@@ -48,16 +35,9 @@ class ApiGatewayScanner(BaseScanner):
         resources: list[Resource] = []
         items: list[dict] = []
 
-        try:
-            paginator = apigw.get_paginator("get_rest_apis")
-            for page in paginator.paginate():
-                items.extend(page.get("items", []))
-        except ClientError as e:
-            logger.warning(
-                "API Gateway GetRestApis failed in %s: %s",
-                region, e.response["Error"]["Code"],
-            )
-            return resources
+        paginator = apigw.get_paginator("get_rest_apis")
+        for page in paginator.paginate():
+            items.extend(page.get("items", []))
 
         for api in items:
             api_id = api["id"]
@@ -70,7 +50,12 @@ class ApiGatewayScanner(BaseScanner):
                     "GetStages %s failed: %s", api_id, e.response["Error"]["Code"]
                 )
 
-            resources.append(self._normalize_rest_api(api, stages, region))
+            try:
+                resources.append(self._normalize_rest_api(api, stages, region))
+            except Exception as e:
+                logger.warning(
+                    "[apigateway] failed to normalize REST API %s: %s", api_id, e,
+                )
 
         return resources
 
@@ -118,7 +103,6 @@ class ApiGatewayScanner(BaseScanner):
             "stage_summaries": stage_summaries,
             "stage_waf_arns": stage_waf_arns,
             "has_waf": bool(stage_waf_arns),
-            # True if the API has no auth at all (inferred from stage count and no Cognito/Lambda authorizers)
             "has_authorizers": bool(api.get("disableExecuteApiEndpoint") is False),
         }
 
@@ -138,26 +122,23 @@ class ApiGatewayScanner(BaseScanner):
         apigwv2 = self.session.client("apigatewayv2", region=region)
         resources: list[Resource] = []
 
-        try:
-            paginator = apigwv2.get_paginator("get_apis")
-            for page in paginator.paginate():
-                for api in page.get("Items", []):
-                    # Fetch authorizers to know if auth is configured
-                    authorizers: list[dict] = []
-                    try:
-                        auth_resp = apigwv2.get_authorizers(ApiId=api["ApiId"])
-                        authorizers = auth_resp.get("Items", [])
-                    except ClientError:
-                        pass
+        paginator = apigwv2.get_paginator("get_apis")
+        for page in paginator.paginate():
+            for api in page.get("Items", []):
+                authorizers: list[dict] = []
+                try:
+                    auth_resp = apigwv2.get_authorizers(ApiId=api["ApiId"])
+                    authorizers = auth_resp.get("Items", [])
+                except ClientError:
+                    pass
 
-                    resources.append(
-                        self._normalize_http_api(api, authorizers, region)
+                try:
+                    resources.append(self._normalize_http_api(api, authorizers, region))
+                except Exception as e:
+                    logger.warning(
+                        "[apigateway] failed to normalize HTTP API %s: %s",
+                        api.get("ApiId", "?"), e,
                     )
-        except ClientError as e:
-            logger.warning(
-                "API Gateway v2 GetApis failed in %s: %s",
-                region, e.response["Error"]["Code"],
-            )
 
         return resources
 
@@ -165,7 +146,6 @@ class ApiGatewayScanner(BaseScanner):
         self, api: dict, authorizers: list[dict], region: str
     ) -> Resource:
         api_id = api["ApiId"]
-        # v2 ARN format used by WAFv2 resource associations
         arn = f"arn:aws:apigateway:{region}::/apis/{api_id}"
 
         cors = api.get("CorsConfiguration") or {}
@@ -178,7 +158,7 @@ class ApiGatewayScanner(BaseScanner):
         properties = {
             "api_id": api_id,
             "name": api.get("Name"),
-            "protocol_type": api.get("ProtocolType"),   # HTTP or WEBSOCKET
+            "protocol_type": api.get("ProtocolType"),
             "endpoint": api.get("ApiEndpoint"),
             "is_websocket": api.get("ProtocolType") == "WEBSOCKET",
             "disable_execute_api_endpoint": api.get("DisableExecuteApiEndpoint", False),

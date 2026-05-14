@@ -339,6 +339,11 @@ def scan(
     console.print()
     console.print(table)
 
+    # Error category breakdown — shows what KIND of failures happened so the
+    # user can distinguish "fix the IAM role" from "this region is opt-in".
+    if all_errors:
+        _print_error_categories(console, all_errors, verbose=verbose)
+
     # Posture analysis — no additional AWS calls, runs on the scan result in memory
     console.print("\n[bold]Running posture analysis...[/bold]")
     posture_findings = PostureAnalyzer().analyze(result)
@@ -547,6 +552,62 @@ def graph(
 
     if not html and not serialize:
         console.print("\n[dim]Tip: use --html graph.html or --serialize attack_surface.txt[/dim]")
+
+
+def _print_error_categories(con: Console, errors: list[dict], verbose: bool) -> None:
+    """Show categorized error counts so the user can distinguish actionable
+    failures (permission_denied — fix the IAM role) from expected ones
+    (not_available — region not opted in) from transient ones (retriable)."""
+    from collections import Counter
+
+    _CATEGORY_STYLE = {
+        "permission_denied": "bold red",   # IAM role needs fixing
+        "retriable":         "yellow",      # boto3 retries gave up
+        "unknown":           "yellow",      # unexpected — investigate
+        "not_available":     "dim",         # opt-in regions, etc.
+    }
+    _CATEGORY_HINT = {
+        "permission_denied": "→ scanner role is missing permissions",
+        "retriable":         "→ boto3 retries exhausted (Throttling)",
+        "unknown":           "→ unexpected error — check logs",
+        "not_available":     "→ service / region not available (expected)",
+    }
+
+    counts = Counter(e.get("category", "unknown") for e in errors)
+    if not counts:
+        return
+
+    t = Table(title="Error categories", show_header=True)
+    t.add_column("Category", style="bold")
+    t.add_column("Count", justify="right")
+    t.add_column("Action", style="dim")
+    for cat in ("permission_denied", "retriable", "unknown", "not_available"):
+        n = counts.get(cat, 0)
+        if not n:
+            continue
+        style = _CATEGORY_STYLE[cat]
+        t.add_row(
+            f"[{style}]{cat}[/{style}]",
+            str(n),
+            _CATEGORY_HINT[cat],
+        )
+    con.print()
+    con.print(t)
+
+    # In verbose mode, show the most actionable errors (permission_denied)
+    # with the actual service/operation/region so users can fix the role.
+    if verbose:
+        denied = [e for e in errors if e.get("category") == "permission_denied"]
+        if denied:
+            con.print("\n[bold red]Permission-denied details:[/bold red]")
+            for e in denied[:20]:  # cap output
+                con.print(
+                    f"  - {e.get('service', '?')}:{e.get('operation', '?')} "
+                    f"in {e.get('region', '?')} "
+                    f"(account {e.get('account_id', '?')}) — {e.get('error_code', '?')}"
+                )
+            if len(denied) > 20:
+                con.print(f"  [dim]... and {len(denied) - 20} more[/dim]")
 
 
 def _print_posture_summary(con: Console, findings: list) -> None:

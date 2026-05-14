@@ -1,22 +1,5 @@
 """
 ECS scanner — clusters, services, and task definitions.
-
-Key properties for graph reasoning:
-  Cluster:
-    - container_insights_enabled → negative finding if off
-
-  Service:
-    - security_group_ids         → SG attachment edges (awsvpc network mode)
-    - assign_public_ip           → internet-facing finding if ENABLED
-    - task_definition_arn        → links to the task definition in use
-
-  Task definition:
-    - task_role_arn              → CRITICAL: IAM role the running container inherits.
-                                   SSRF on any container → IMDSv2 (or token mount) →
-                                   steal this role → pivot to AWS resources.
-    - execution_role_arn         → what ECS agent uses to pull images + push logs
-    - has_privileged_container   → privileged mode = near-full host access
-    - pid_mode / ipc_mode = host → container escapes to host PID/IPC namespace
 """
 from __future__ import annotations
 
@@ -34,60 +17,58 @@ class EcsScanner(BaseScanner):
     domain = "containers"
 
     def _scan_region(self, region: str) -> list[Resource]:
+        return self._safe_scan_call(
+            "ecs", "list_clusters", region, lambda: self._scan_ecs(region),
+        )
+
+    def _scan_ecs(self, region: str) -> list[Resource]:
         resources: list[Resource] = []
         ecs = self.session.client("ecs", region=region)
 
-        try:
-            cluster_arns = _paginate(ecs, "list_clusters", "clusterArns")
-        except ClientError as e:
-            logger.warning(
-                "ECS ListClusters failed in %s: %s", region, e.response["Error"]["Code"]
-            )
-            raise
-
+        cluster_arns = _paginate(ecs, "list_clusters", "clusterArns")
         if not cluster_arns:
             return resources
 
-        # Describe clusters in batches of 100 (ECS hard limit)
         for i in range(0, len(cluster_arns), 100):
             batch = cluster_arns[i : i + 100]
             try:
                 resp = ecs.describe_clusters(clusters=batch, include=["SETTINGS", "TAGS"])
                 for cluster in resp.get("clusters", []):
-                    resources.append(self._normalize_cluster(cluster, region))
+                    try:
+                        resources.append(self._normalize_cluster(cluster, region))
+                    except Exception as e:
+                        logger.warning(
+                            "[containers] failed to normalize cluster %s: %s",
+                            cluster.get("clusterName", "?"), e,
+                        )
             except ClientError as e:
                 logger.warning(
                     "ECS DescribeClusters failed: %s", e.response["Error"]["Code"]
                 )
 
-        # Services per cluster and collect unique task definition ARNs
         task_def_arns: set[str] = set()
         for cluster_arn in cluster_arns:
             self._scan_services(ecs, cluster_arn, region, resources, task_def_arns)
 
-        # Task definitions referenced by active services
         for td_arn in task_def_arns:
             try:
                 resp = ecs.describe_task_definition(taskDefinition=td_arn, include=["TAGS"])
-                resources.append(
-                    self._normalize_task_definition(resp["taskDefinition"], region)
-                )
+                resources.append(self._normalize_task_definition(resp["taskDefinition"], region))
             except ClientError as e:
                 logger.warning(
                     "DescribeTaskDefinition %s failed: %s",
-                    td_arn,
-                    e.response["Error"]["Code"],
+                    td_arn, e.response["Error"]["Code"],
+                )
+            except Exception as e:
+                logger.warning(
+                    "[containers] failed to normalize task def %s: %s", td_arn, e,
                 )
 
         return resources
 
     def _scan_services(
-        self,
-        ecs,
-        cluster_arn: str,
-        region: str,
-        resources: list[Resource],
-        task_def_arns: set[str],
+        self, ecs, cluster_arn: str, region: str,
+        resources: list[Resource], task_def_arns: set[str],
     ) -> None:
         try:
             service_arns = _paginate(ecs, "list_services", "serviceArns", cluster=cluster_arn)
@@ -97,7 +78,6 @@ class EcsScanner(BaseScanner):
             )
             return
 
-        # Describe in batches of 10 (ECS hard limit)
         for i in range(0, len(service_arns), 10):
             batch = service_arns[i : i + 10]
             try:
@@ -105,10 +85,16 @@ class EcsScanner(BaseScanner):
                     cluster=cluster_arn, services=batch, include=["TAGS"]
                 )
                 for svc in resp.get("services", []):
-                    resources.append(self._normalize_service(svc, region))
-                    td_arn = svc.get("taskDefinition")
-                    if td_arn:
-                        task_def_arns.add(td_arn)
+                    try:
+                        resources.append(self._normalize_service(svc, region))
+                        td_arn = svc.get("taskDefinition")
+                        if td_arn:
+                            task_def_arns.add(td_arn)
+                    except Exception as e:
+                        logger.warning(
+                            "[containers] failed to normalize service %s: %s",
+                            svc.get("serviceName", "?"), e,
+                        )
             except ClientError as e:
                 logger.warning(
                     "DescribeServices failed: %s", e.response["Error"]["Code"]

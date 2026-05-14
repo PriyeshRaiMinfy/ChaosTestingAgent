@@ -1,15 +1,5 @@
 """
-Cognito scanner — user pools.
-
-Cognito user pools are regional (unlike IAM), so this scanner runs per region.
-
-Key properties for security analysis:
-  - mfa_required = False         → users authenticate with password only
-  - advanced_security_mode = OFF → no adaptive auth, no compromised-credential checks
-  - deletion_protection = False  → pool can be deleted without confirmation
-  - password_min_length < 12     → weak password policy
-  - lambda_trigger_count > 0     → pre/post-auth Lambda hooks (can be attack surface
-                                    if the Lambda has permissive IAM role)
+Cognito scanner — user pools (regional).
 """
 from __future__ import annotations
 
@@ -27,22 +17,20 @@ class CognitoScanner(BaseScanner):
     domain = "cognito"
 
     def _scan_region(self, region: str) -> list[Resource]:
+        return self._safe_scan_call(
+            "cognito-idp", "list_user_pools", region,
+            lambda: self._scan_user_pools(region),
+        )
+
+    def _scan_user_pools(self, region: str) -> list[Resource]:
         cognito = self.session.client("cognito-idp", region=region)
         resources: list[Resource] = []
 
         pool_ids: list[str] = []
-        try:
-            paginator = cognito.get_paginator("list_user_pools")
-            for page in paginator.paginate(MaxResults=60):
-                for pool in page.get("UserPools", []):
-                    pool_ids.append(pool["Id"])
-        except ClientError as e:
-            logger.warning(
-                "Cognito ListUserPools failed in %s: %s",
-                region,
-                e.response["Error"]["Code"],
-            )
-            raise
+        paginator = cognito.get_paginator("list_user_pools")
+        for page in paginator.paginate(MaxResults=60):
+            for pool in page.get("UserPools", []):
+                pool_ids.append(pool["Id"])
 
         for pool_id in pool_ids:
             try:
@@ -51,8 +39,11 @@ class CognitoScanner(BaseScanner):
             except ClientError as e:
                 logger.warning(
                     "DescribeUserPool %s failed: %s",
-                    pool_id,
-                    e.response["Error"]["Code"],
+                    pool_id, e.response["Error"]["Code"],
+                )
+            except Exception as e:
+                logger.warning(
+                    "[cognito] failed to normalize user pool %s: %s", pool_id, e,
                 )
 
         return resources
@@ -69,7 +60,6 @@ class CognitoScanner(BaseScanner):
         pwd_policy = (pool.get("Policies") or {}).get("PasswordPolicy") or {}
         addons = pool.get("UserPoolAddOns") or {}
 
-        # Lambda triggers are keys in LambdaConfig whose values are Lambda ARNs
         lambda_config = pool.get("LambdaConfig") or {}
         trigger_arns = [v for v in lambda_config.values() if isinstance(v, str) and v.startswith("arn:")]
 

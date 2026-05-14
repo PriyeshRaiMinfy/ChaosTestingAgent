@@ -1,22 +1,9 @@
 """
-CloudFront scanner — distributions.
-
-CloudFront is a global service; distributions are scanned once from us-east-1.
-
-Key attack-path properties:
-  - viewer_protocol_policy = allow-all  → HTTP (unencrypted) traffic accepted
-  - web_acl_id = ""                     → no WAF protecting this distribution
-  - origins with S3 + no OAI/OAC       → S3 bucket accessible directly (bypass CDN)
-  - geo_restriction_type = none         → accessible from any country
-  - has_logging = False                 → no access logs captured
-
-ARN format: arn:aws:cloudfront::{account_id}:distribution/{distribution_id}
+CloudFront scanner — distributions (global, scanned from us-east-1).
 """
 from __future__ import annotations
 
 import logging
-
-from botocore.exceptions import ClientError
 
 from breakbot.models import Resource, ResourceType
 from breakbot.scanner.base import BaseScanner
@@ -29,20 +16,26 @@ class CloudFrontScanner(BaseScanner):
     is_global = True  # CloudFront is global — scan once
 
     def _scan_region(self, region: str) -> list[Resource]:
+        return self._safe_scan_call(
+            "cloudfront", "list_distributions", region,
+            lambda: self._scan_distributions(),
+        )
+
+    def _scan_distributions(self) -> list[Resource]:
         cf = self.session.client("cloudfront", region="us-east-1")
         resources: list[Resource] = []
 
-        try:
-            paginator = cf.get_paginator("list_distributions")
-            for page in paginator.paginate():
-                dist_list = page.get("DistributionList", {})
-                for item in dist_list.get("Items", []):
+        paginator = cf.get_paginator("list_distributions")
+        for page in paginator.paginate():
+            dist_list = page.get("DistributionList", {})
+            for item in dist_list.get("Items", []):
+                try:
                     resources.append(self._normalize_distribution(item))
-        except ClientError as e:
-            logger.warning(
-                "CloudFront ListDistributions failed: %s", e.response["Error"]["Code"]
-            )
-            raise
+                except Exception as e:
+                    logger.warning(
+                        "[cdn] failed to normalize distribution %s: %s",
+                        item.get("Id", "?"), e,
+                    )
 
         return resources
 
@@ -66,7 +59,6 @@ class CloudFrontScanner(BaseScanner):
                 "custom_protocol": custom_origin.get("OriginProtocolPolicy"),
             })
 
-        # Detect S3 origins without Origin Access Identity / OAC (publicly readable via S3 URL)
         s3_origins_without_oai = [
             o for o in origins
             if o["is_s3_origin"] and not o["oai"]
