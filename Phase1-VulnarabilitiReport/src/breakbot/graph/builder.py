@@ -74,6 +74,7 @@ class GraphBuilder:
         self._add_network_reachability_edges()
         self._add_internet_exposure_edges()
         self._add_iam_policy_access_edges()
+        self._add_resource_policy_edges()
         self._add_vpc_membership_edges()
         self._add_encryption_edges()
         self._add_target_group_edges()
@@ -409,6 +410,82 @@ class GraphBuilder:
                     return stripped
         return arn
 
+    # ────────────────── Resource-based Policy Edges ───────────────────────
+
+    def _add_resource_policy_edges(self) -> None:
+        """
+        For each resource that carries a resource-based policy (S3 bucket,
+        KMS key), parse Allow statements and add resource_policy_grants edges
+        from each named AWS Principal → the resource.
+
+        This complements iam_can_access (identity-based policy) — together
+        they capture both sides of AWS's two-policy access model.
+
+        Wildcard principals (Principal:"*") are NOT added here — they're
+        already surfaced by posture findings (S3_BUCKET_POLICY_PUBLIC).
+        Adding them as edges would explode the graph with low-signal nodes.
+        Service principals (Principal:{"Service":...}) are also skipped —
+        they aren't part of attack-chain reasoning.
+        """
+        _POLICY_PROPERTY_BY_TYPE = {
+            ResourceType.S3_BUCKET: "bucket_policy",
+            ResourceType.KMS_KEY:   "key_policy",
+        }
+
+        for resource in self.result.resources:
+            policy_prop = _POLICY_PROPERTY_BY_TYPE.get(resource.resource_type)
+            if policy_prop is None:
+                continue
+            policy = resource.properties.get(policy_prop)
+            if not isinstance(policy, dict):
+                continue
+
+            for stmt in policy.get("Statement", []):
+                if stmt.get("Effect") != "Allow":
+                    continue
+
+                actions = _as_list(stmt.get("Action", []))
+                resources_pattern = _as_list(stmt.get("Resource", []))
+                has_conditions = bool(stmt.get("Condition"))
+                is_wildcard_action = any(a == "*" or a.endswith(":*") for a in actions)
+
+                for principal_id in _normalize_principals(stmt.get("Principal", {})):
+                    # Skip non-principal cases:
+                    #   "*"                    → covered by posture findings
+                    #   "<service>.amazonaws.com" → service trust, not attack-chain
+                    #   "federated:..."        → handled elsewhere
+                    if principal_id == "*":
+                        continue
+                    if principal_id.endswith(".amazonaws.com"):
+                        continue
+                    if principal_id.startswith("federated:"):
+                        continue
+
+                    # Add the principal as a node if we don't have one yet.
+                    # Cross-account principals or roles outside the scan
+                    # become stub nodes (is_external=True).
+                    if principal_id not in self.graph.nodes:
+                        is_external = principal_id not in self._arn_index
+                        self._ensure_node(
+                            principal_id,
+                            "external_principal" if is_external else None,
+                            is_external=is_external,
+                        )
+
+                    self.graph.add_edge(
+                        principal_id,
+                        resource.arn,
+                        edge_type=EdgeType.RESOURCE_POLICY_GRANTS,
+                        label=EdgeType.RESOURCE_POLICY_GRANTS.value,
+                        actions=actions,
+                        resource_pattern=resources_pattern,
+                        has_conditions=has_conditions,
+                        is_wildcard_resource=(
+                            "*" in resources_pattern or not resources_pattern
+                        ),
+                        is_admin=is_wildcard_action,
+                    )
+
     # ──────────────────── VPC Membership Edges ────────────────────────────
 
     def _add_vpc_membership_edges(self) -> None:
@@ -646,10 +723,22 @@ class GraphBuilder:
 
     # ─────────────────────────── Helpers ──────────────────────────────────
 
-    def _ensure_node(self, node_id: str, node_type: str = "unknown") -> None:
-        """Add a node only if it doesn't already exist."""
-        if node_id not in self.graph:
-            self.graph.add_node(node_id, type=node_type, name=node_id)
+    def _ensure_node(
+        self,
+        node_id: str,
+        node_type: str | None = "unknown",
+        **extra_attrs: Any,
+    ) -> None:
+        """
+        Add a node only if it doesn't already exist. Extra kwargs become
+        node attributes (e.g., is_external=True for stub principals).
+        """
+        if node_id in self.graph:
+            return
+        attrs: dict[str, Any] = {"name": node_id, **extra_attrs}
+        if node_type is not None:
+            attrs["type"] = node_type
+        self.graph.add_node(node_id, **attrs)
 
 
 # ─────────────────────────── Module helpers ───────────────────────────────
