@@ -709,6 +709,14 @@ def report(
         help="Write report to this file. Defaults to report.md / report.json in the scan dir.",
     ),
     max_hops: int = typer.Option(5, "--max-hops", help="Max path length for attack surface graph"),
+    token_budget: int = typer.Option(
+        0, "--token-budget",
+        help="Cap the attack-surface text sent to Claude (rough tokens). "
+             "0 = no cap. 200000 is a reasonable default for very large accounts "
+             "(leaves room for the system prompt + response within Opus 4.7's 1M window). "
+             "ENTRY POINTS / SINKS / PATHS are always preserved in full; "
+             "ALL NODES / ALL EDGES sections truncate first.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
     """Generate an LLM-powered attack-path report from a completed scan.
@@ -752,7 +760,14 @@ def report(
 
     from breakbot.graph import GraphSerializer
     serializer = GraphSerializer(g, builder.arn_index, max_hops=max_hops)
-    attack_surface = serializer.serialize()
+    # tokens ≈ chars / 3 for English; 0 means no cap
+    max_chars = token_budget * 3 if token_budget > 0 else None
+    attack_surface = serializer.serialize(max_chars=max_chars)
+    if max_chars is not None and len(attack_surface) >= max_chars:
+        console.print(
+            f"[yellow]⚠ Attack surface truncated to fit ~{token_budget} tokens "
+            f"({len(attack_surface)} chars)[/yellow]"
+        )
 
     # Load posture findings
     posture_findings: list[dict] = []
