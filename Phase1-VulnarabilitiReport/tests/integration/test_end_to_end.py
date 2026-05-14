@@ -308,8 +308,10 @@ def test_attack_surface_text_contains_path(serializer):
     assert "web-01" in text
     assert "AppRole" in text
     assert "customer-data" in text
-    # At least one path entry rendered
-    assert "PATH 1:" in text
+    # At least one path entry rendered. The header is "PATH N:" or
+    # "PATH N [MARKERS]:" depending on whether the ranker found admin /
+    # wildcard / confirmed / weak edges on the path.
+    assert "PATH 1" in text and ":" in text.split("PATH 1", 1)[1].split("\n", 1)[0]
 
 
 # ─────────────────────────── Phase 3: posture ─────────────────────────────
