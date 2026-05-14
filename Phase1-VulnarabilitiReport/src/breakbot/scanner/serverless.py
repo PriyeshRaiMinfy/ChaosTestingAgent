@@ -1,22 +1,5 @@
 """
 Serverless orchestration scanner — EventBridge rules and Step Functions state machines.
-
-Key attack-path properties:
-  EventBridge rule:
-    - targets with cross-account ARNs  → data can flow to external accounts
-    - targets with role_arn set         → EventBridge assumes that role to deliver events
-    - schedule_expression set           → scheduled invocation (attacker-visible timing)
-
-  Step Functions state machine:
-    - role_arn                          → IAM role with all permissions the workflow needs;
-                                          a compromised state machine = this role stolen
-    - logging_level = OFF               → no execution history in CloudWatch
-    - type = EXPRESS                    → high-throughput, async; logs go to CW only if configured
-    - tracing_enabled = False           → no X-Ray traces for debugging attack paths
-
-ARN formats:
-  EventBridge rule: arn:aws:events:{region}:{account_id}:rule/{bus_name}/{rule_name}
-  Step Functions:   arn:aws:states:{region}:{account_id}:stateMachine:{name}
 """
 from __future__ import annotations
 
@@ -35,8 +18,14 @@ class ServerlessScanner(BaseScanner):
 
     def _scan_region(self, region: str) -> list[Resource]:
         resources: list[Resource] = []
-        resources.extend(self._scan_eventbridge(region))
-        resources.extend(self._scan_step_functions(region))
+        resources.extend(self._safe_scan_call(
+            "events", "list_event_buses", region,
+            lambda: self._scan_eventbridge(region),
+        ))
+        resources.extend(self._safe_scan_call(
+            "stepfunctions", "list_state_machines", region,
+            lambda: self._scan_step_functions(region),
+        ))
         return resources
 
     # ──────────────────────── EventBridge ─────────────────────────────────
@@ -45,26 +34,17 @@ class ServerlessScanner(BaseScanner):
         events = self.session.client("events", region=region)
         resources: list[Resource] = []
 
-        # Collect all event buses (default + custom)
         bus_names: list[str] = []
-        try:
-            paginator = events.get_paginator("list_event_buses")
-            for page in paginator.paginate():
-                for bus in page.get("EventBuses", []):
-                    bus_names.append(bus["Name"])
-        except ClientError as e:
-            logger.warning(
-                "EventBridge ListEventBuses failed in %s: %s",
-                region, e.response["Error"]["Code"],
-            )
-            return resources
+        paginator = events.get_paginator("list_event_buses")
+        for page in paginator.paginate():
+            for bus in page.get("EventBuses", []):
+                bus_names.append(bus["Name"])
 
         for bus_name in bus_names:
             try:
                 paginator = events.get_paginator("list_rules")
                 for page in paginator.paginate(EventBusName=bus_name):
                     for rule in page.get("Rules", []):
-                        # Fetch targets for this rule
                         targets: list[dict] = []
                         try:
                             t_resp = events.list_targets_by_rule(
@@ -76,9 +56,15 @@ class ServerlessScanner(BaseScanner):
                                 "ListTargetsByRule %s failed: %s",
                                 rule["Name"], e.response["Error"]["Code"],
                             )
-                        resources.append(
-                            self._normalize_rule(rule, bus_name, targets, region)
-                        )
+                        try:
+                            resources.append(
+                                self._normalize_rule(rule, bus_name, targets, region)
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "[serverless] failed to normalize rule %s: %s",
+                                rule.get("Name", "?"), e,
+                            )
             except ClientError as e:
                 logger.warning(
                     "EventBridge ListRules %s failed in %s: %s",
@@ -103,11 +89,10 @@ class ServerlessScanner(BaseScanner):
         for t in targets:
             t_arn = t.get("Arn", "")
             t_role = t.get("RoleArn", "")
-            # Cross-account = target ARN is in a different account
             is_cross_acct = (
                 t_arn.startswith("arn:aws")
                 and f":{self.session.account_id}:" not in t_arn
-                and "amazonaws.com" not in t_arn  # exclude AWS service endpoints
+                and "amazonaws.com" not in t_arn
             )
             if is_cross_acct:
                 cross_account_targets.append(t_arn)
@@ -124,7 +109,7 @@ class ServerlessScanner(BaseScanner):
         properties = {
             "rule_name": rule_name,
             "event_bus_name": bus_name,
-            "state": rule.get("State"),              # ENABLED or DISABLED
+            "state": rule.get("State"),
             "schedule_expression": rule.get("ScheduleExpression"),
             "is_scheduled": bool(rule.get("ScheduleExpression")),
             "event_pattern": rule.get("EventPattern"),
@@ -151,25 +136,24 @@ class ServerlessScanner(BaseScanner):
         sfn = self.session.client("stepfunctions", region=region)
         resources: list[Resource] = []
 
-        try:
-            paginator = sfn.get_paginator("list_state_machines")
-            for page in paginator.paginate():
-                for sm in page.get("stateMachines", []):
-                    try:
-                        detail = sfn.describe_state_machine(
-                            stateMachineArn=sm["stateMachineArn"]
-                        )
-                        resources.append(self._normalize_state_machine(detail, region))
-                    except ClientError as e:
-                        logger.warning(
-                            "DescribeStateMachine %s failed: %s",
-                            sm["name"], e.response["Error"]["Code"],
-                        )
-        except ClientError as e:
-            logger.warning(
-                "Step Functions ListStateMachines failed in %s: %s",
-                region, e.response["Error"]["Code"],
-            )
+        paginator = sfn.get_paginator("list_state_machines")
+        for page in paginator.paginate():
+            for sm in page.get("stateMachines", []):
+                try:
+                    detail = sfn.describe_state_machine(
+                        stateMachineArn=sm["stateMachineArn"]
+                    )
+                    resources.append(self._normalize_state_machine(detail, region))
+                except ClientError as e:
+                    logger.warning(
+                        "DescribeStateMachine %s failed: %s",
+                        sm["name"], e.response["Error"]["Code"],
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[serverless] failed to normalize state machine %s: %s",
+                        sm.get("name", "?"), e,
+                    )
 
         return resources
 
@@ -183,16 +167,9 @@ class ServerlessScanner(BaseScanner):
         tracing = sm.get("tracingConfiguration") or {}
         tracing_enabled = tracing.get("enabled", False)
 
-        tags: dict[str, str] = {}
-        try:
-            # tags are not in describe_state_machine response, skip for now
-            pass
-        except Exception:
-            pass
-
         properties = {
             "state_machine_name": name,
-            "type": sm.get("type"),           # STANDARD or EXPRESS
+            "type": sm.get("type"),
             "status": sm.get("status"),
             "role_arn": sm.get("roleArn"),
             "logging_level": logging_level,
@@ -207,6 +184,6 @@ class ServerlessScanner(BaseScanner):
             name=name,
             region=region,
             account_id=self.session.account_id,
-            tags=tags,
+            tags={},
             properties=properties,
         )

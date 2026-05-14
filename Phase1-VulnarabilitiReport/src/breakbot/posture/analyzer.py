@@ -30,6 +30,25 @@ _SG_PORT_CHECKS: dict[int, tuple[str, str, Severity]] = {
 
 _SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
 
+# Lambda runtimes that have hit end-of-support as of 2026. AWS stops applying
+# security patches after EOL — using these is a known-CVE risk.
+_LAMBDA_EOL_RUNTIMES = frozenset({
+    "python2.7", "python3.6", "python3.7", "python3.8", "python3.9",
+    "nodejs10.x", "nodejs12.x", "nodejs14.x", "nodejs16.x",
+    "ruby2.5", "ruby2.7", "ruby3.0",
+    "dotnetcore2.1", "dotnetcore3.1", "dotnet5.0", "dotnet6",
+    "go1.x",
+    "java8",
+})
+
+# Substrings that suggest a parameter holds a credential regardless of its
+# declared Type. SSM parameters that match these but are stored as plain
+# String (not SecureString) are a finding.
+_SECRET_NAME_PATTERNS = (
+    "password", "secret", "token", "apikey", "api_key",
+    "credential", "private", "passwd",
+)
+
 
 class PostureAnalyzer:
     """
@@ -75,6 +94,13 @@ class PostureAnalyzer:
             ResourceType.ECS_CLUSTER:                  self._check_ecs_cluster,
             ResourceType.EKS_CLUSTER:                  self._check_eks,
             ResourceType.IAM_USER:                     self._check_iam_user,
+            ResourceType.IAM_ROLE:                     self._check_iam_role,
+            ResourceType.LAMBDA_FUNCTION:              self._check_lambda,
+            ResourceType.EC2_INSTANCE:                 self._check_ec2,
+            ResourceType.SECRETS_MANAGER_SECRET:       self._check_secret,
+            ResourceType.SSM_PARAMETER:                self._check_ssm_parameter,
+            ResourceType.VPC:                          self._check_vpc,
+            ResourceType.ALB:                          self._check_alb,
             ResourceType.COGNITO_USER_POOL:            self._check_cognito,
             ResourceType.API_GATEWAY_REST_API:         self._check_apigw_rest,
             ResourceType.API_GATEWAY_HTTP_API:         self._check_apigw_http,
@@ -787,6 +813,239 @@ class PostureAnalyzer:
                 "Enable X-Ray tracing to get distributed traces across state machine executions.",
             ))
 
+        return findings
+
+    # ─────────────────────────── IAM Roles ────────────────────────────────
+
+    def _check_iam_role(self, r: Resource) -> list[PostureFinding]:
+        """
+        Trust policy + permission audits. Three high-value checks:
+          1. Wildcard Principal in trust policy (anyone can assume)
+          2. Cross-account trust without aws:ExternalId (confused-deputy)
+          3. iam:PassRole with wildcard resource (privesc to any role)
+        """
+        findings: list[PostureFinding] = []
+        trust = r.properties.get("trust_policy") or {}
+
+        # (1) Wildcard trust
+        for stmt in trust.get("Statement", []):
+            if stmt.get("Effect") != "Allow":
+                continue
+            principal = stmt.get("Principal", {})
+            is_wildcard = (
+                principal == "*"
+                or principal == {"AWS": "*"}
+                or (isinstance(principal, dict) and principal.get("AWS") == "*")
+            )
+            if is_wildcard and not stmt.get("Condition"):
+                findings.append(self._f(
+                    r,
+                    "IAM_ROLE_WILDCARD_TRUST",
+                    Severity.CRITICAL,
+                    "identity",
+                    "IAM role trust policy allows any AWS principal to assume it",
+                    "Principal: * (no Condition) — any AWS account can assume this role",
+                    "Restrict the trust policy to specific account IDs / role ARNs, "
+                    "or add an sts:ExternalId / aws:SourceArn condition.",
+                ))
+                break
+
+        # (2) Cross-account trust without ExternalId
+        for stmt in trust.get("Statement", []):
+            if stmt.get("Effect") != "Allow":
+                continue
+            principal = stmt.get("Principal", {})
+            if not isinstance(principal, dict):
+                continue
+            aws_p = principal.get("AWS")
+            if isinstance(aws_p, str):
+                aws_p = [aws_p]
+            if not aws_p:
+                continue
+
+            is_cross_account = any(
+                isinstance(p, str)
+                and p.startswith("arn:aws:iam::")
+                and f"::{r.account_id}:" not in p
+                for p in aws_p
+            )
+            if not is_cross_account:
+                continue
+
+            condition = stmt.get("Condition") or {}
+            cond_keys: set[str] = set()
+            for cond_block in condition.values():
+                if isinstance(cond_block, dict):
+                    cond_keys.update(cond_block.keys())
+            has_external_id = any(
+                k.lower() == "sts:externalid" for k in cond_keys
+            )
+
+            if not has_external_id:
+                findings.append(self._f(
+                    r,
+                    "IAM_ROLE_CROSS_ACCOUNT_NO_EXTERNAL_ID",
+                    Severity.HIGH,
+                    "identity",
+                    "IAM role trusts a cross-account principal without ExternalId condition",
+                    "Cross-account trust statement is missing sts:ExternalId — confused-deputy risk",
+                    "Add Condition: { StringEquals: { 'sts:ExternalId': '<unique-secret>' } } "
+                    "to the trust statement.",
+                ))
+                break
+
+        # (3) Wildcard iam:PassRole across all policy documents
+        all_policies = (
+            (r.properties.get("inline_policies") or [])
+            + (r.properties.get("managed_policies") or [])
+        )
+        for policy in all_policies:
+            doc = policy.get("document") or {}
+            for stmt in doc.get("Statement", []):
+                if stmt.get("Effect") != "Allow":
+                    continue
+                actions = stmt.get("Action", [])
+                if isinstance(actions, str):
+                    actions = [actions]
+                resources_list = stmt.get("Resource", [])
+                if isinstance(resources_list, str):
+                    resources_list = [resources_list]
+
+                allows_pass_role = any(
+                    a in ("iam:*", "iam:PassRole", "*") for a in actions
+                )
+                if allows_pass_role and "*" in resources_list:
+                    findings.append(self._f(
+                        r,
+                        "IAM_ROLE_WILDCARD_PASS_ROLE",
+                        Severity.HIGH,
+                        "identity",
+                        "IAM role grants iam:PassRole on a wildcard resource",
+                        f"Policy '{policy.get('name', '?')}' allows iam:PassRole on '*' "
+                        "— can attach any role to any service",
+                        "Restrict iam:PassRole to specific role ARNs and add a "
+                        "iam:PassedToService condition where possible.",
+                    ))
+                    return findings  # one is enough; stop scanning policies
+
+        return findings
+
+    # ─────────────────────────── Lambda ──────────────────────────────────
+
+    def _check_lambda(self, r: Resource) -> list[PostureFinding]:
+        findings: list[PostureFinding] = []
+        runtime = r.properties.get("runtime")
+        if runtime in _LAMBDA_EOL_RUNTIMES:
+            findings.append(self._f(
+                r,
+                "LAMBDA_EOL_RUNTIME",
+                Severity.HIGH,
+                "compute",
+                f"Lambda function uses EOL/deprecated runtime ({runtime})",
+                f"runtime={runtime} — AWS no longer applies security patches",
+                "Upgrade to a supported runtime (e.g., python3.12, nodejs20.x, java21). "
+                "Use `aws lambda list-functions` to inventory all functions on EOL runtimes.",
+            ))
+        return findings
+
+    # ─────────────────────────── EC2 ──────────────────────────────────────
+
+    def _check_ec2(self, r: Resource) -> list[PostureFinding]:
+        findings: list[PostureFinding] = []
+        p = r.properties
+
+        if p.get("imds_v1_allowed"):
+            findings.append(self._f(
+                r,
+                "EC2_IMDSV1_ALLOWED",
+                Severity.HIGH,
+                "compute",
+                "EC2 instance allows IMDSv1 (tokenless metadata access)",
+                "imds_v1_allowed=True — SSRF on this instance can steal the "
+                "instance-profile credentials with no auth challenge",
+                "Set HttpTokens=required on the instance metadata options "
+                "(modify-instance-metadata-options API) to enforce IMDSv2.",
+            ))
+
+        return findings
+
+    # ─────────────────────── Secrets Manager ──────────────────────────────
+
+    def _check_secret(self, r: Resource) -> list[PostureFinding]:
+        findings: list[PostureFinding] = []
+        if not r.properties.get("rotation_enabled"):
+            findings.append(self._f(
+                r,
+                "SECRET_ROTATION_DISABLED",
+                Severity.MEDIUM,
+                "identity",
+                "Secrets Manager secret has automatic rotation disabled",
+                "rotation_enabled=False — credentials never rotate",
+                "Configure rotation with a Lambda rotation function (or use the "
+                "service-native option for RDS / DocumentDB / Redshift secrets).",
+            ))
+        return findings
+
+    # ─────────────────────── SSM Parameter ────────────────────────────────
+
+    def _check_ssm_parameter(self, r: Resource) -> list[PostureFinding]:
+        findings: list[PostureFinding] = []
+        p = r.properties
+        name_lower = (p.get("parameter_name") or "").lower()
+        is_secret_named = any(pat in name_lower for pat in _SECRET_NAME_PATTERNS)
+
+        if is_secret_named and p.get("type") != "SecureString":
+            findings.append(self._f(
+                r,
+                "SSM_PARAMETER_PLAINTEXT_SECRET",
+                Severity.HIGH,
+                "identity",
+                "SSM parameter name suggests a secret but is stored as plaintext",
+                f"type={p.get('type', '?')}, name matches secret-pattern: {p.get('parameter_name')}",
+                "Convert to SecureString. SecureString parameters are KMS-encrypted at rest "
+                "and access can be audited via CloudTrail.",
+            ))
+        return findings
+
+    # ─────────────────────── VPC ──────────────────────────────────────────
+
+    def _check_vpc(self, r: Resource) -> list[PostureFinding]:
+        findings: list[PostureFinding] = []
+        if r.properties.get("is_default") and r.properties.get("state") == "available":
+            findings.append(self._f(
+                r,
+                "DEFAULT_VPC_AVAILABLE",
+                Severity.LOW,
+                "network",
+                "Default VPC is still available in this region",
+                "is_default=True — default VPC has open security group rules and "
+                "an attached internet gateway",
+                "If no workloads use it, delete the default VPC. Custom VPCs give "
+                "explicit control over routing, NACLs, and ingress.",
+            ))
+        return findings
+
+    # ─────────────────────── ALB ──────────────────────────────────────────
+
+    def _check_alb(self, r: Resource) -> list[PostureFinding]:
+        findings: list[PostureFinding] = []
+        p = r.properties
+
+        # NLBs don't use SGs so the missing-SG check only applies to ALBs
+        if (
+            p.get("is_internet_facing")
+            and p.get("is_alb")
+            and not p.get("security_group_ids")
+        ):
+            findings.append(self._f(
+                r,
+                "ALB_INTERNET_FACING_NO_SG",
+                Severity.HIGH,
+                "network",
+                "Internet-facing ALB has no security groups attached",
+                "is_internet_facing=True, security_group_ids=[]",
+                "Attach a security group to the ALB to restrict ingress.",
+            ))
         return findings
 
     # ─────────────────────── EventBridge ──────────────────────────────────

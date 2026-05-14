@@ -13,6 +13,7 @@ class EdgeType(str, Enum):
     # IAM / identity edges
     IAM_CAN_ASSUME = "iam_can_assume"
     IAM_CAN_ACCESS = "iam_can_access"
+    RESOURCE_POLICY_GRANTS = "resource_policy_grants"  # resource-based policy → Principal
     HAS_EXECUTION_ROLE = "has_execution_role"
     HAS_INSTANCE_PROFILE = "has_instance_profile"
 

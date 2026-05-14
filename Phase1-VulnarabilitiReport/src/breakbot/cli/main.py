@@ -339,6 +339,11 @@ def scan(
     console.print()
     console.print(table)
 
+    # Error category breakdown — shows what KIND of failures happened so the
+    # user can distinguish "fix the IAM role" from "this region is opt-in".
+    if all_errors:
+        _print_error_categories(console, all_errors, verbose=verbose)
+
     # Posture analysis — no additional AWS calls, runs on the scan result in memory
     console.print("\n[bold]Running posture analysis...[/bold]")
     posture_findings = PostureAnalyzer().analyze(result)
@@ -549,6 +554,62 @@ def graph(
         console.print("\n[dim]Tip: use --html graph.html or --serialize attack_surface.txt[/dim]")
 
 
+def _print_error_categories(con: Console, errors: list[dict], verbose: bool) -> None:
+    """Show categorized error counts so the user can distinguish actionable
+    failures (permission_denied — fix the IAM role) from expected ones
+    (not_available — region not opted in) from transient ones (retriable)."""
+    from collections import Counter
+
+    _CATEGORY_STYLE = {
+        "permission_denied": "bold red",   # IAM role needs fixing
+        "retriable":         "yellow",      # boto3 retries gave up
+        "unknown":           "yellow",      # unexpected — investigate
+        "not_available":     "dim",         # opt-in regions, etc.
+    }
+    _CATEGORY_HINT = {
+        "permission_denied": "→ scanner role is missing permissions",
+        "retriable":         "→ boto3 retries exhausted (Throttling)",
+        "unknown":           "→ unexpected error — check logs",
+        "not_available":     "→ service / region not available (expected)",
+    }
+
+    counts = Counter(e.get("category", "unknown") for e in errors)
+    if not counts:
+        return
+
+    t = Table(title="Error categories", show_header=True)
+    t.add_column("Category", style="bold")
+    t.add_column("Count", justify="right")
+    t.add_column("Action", style="dim")
+    for cat in ("permission_denied", "retriable", "unknown", "not_available"):
+        n = counts.get(cat, 0)
+        if not n:
+            continue
+        style = _CATEGORY_STYLE[cat]
+        t.add_row(
+            f"[{style}]{cat}[/{style}]",
+            str(n),
+            _CATEGORY_HINT[cat],
+        )
+    con.print()
+    con.print(t)
+
+    # In verbose mode, show the most actionable errors (permission_denied)
+    # with the actual service/operation/region so users can fix the role.
+    if verbose:
+        denied = [e for e in errors if e.get("category") == "permission_denied"]
+        if denied:
+            con.print("\n[bold red]Permission-denied details:[/bold red]")
+            for e in denied[:20]:  # cap output
+                con.print(
+                    f"  - {e.get('service', '?')}:{e.get('operation', '?')} "
+                    f"in {e.get('region', '?')} "
+                    f"(account {e.get('account_id', '?')}) — {e.get('error_code', '?')}"
+                )
+            if len(denied) > 20:
+                con.print(f"  [dim]... and {len(denied) - 20} more[/dim]")
+
+
 def _print_posture_summary(con: Console, findings: list) -> None:
     from collections import Counter
     from breakbot.posture.findings import Severity
@@ -634,6 +695,133 @@ def posture(
                 f"  Detail:   {f.detail}\n"
                 f"  Fix:      {f.remediation}"
             )
+
+
+@app.command()
+def report(
+    scan_dir: Path = typer.Argument(..., help="Path to a scan output directory (e.g. scans/scan-...)"),
+    format: str = typer.Option(
+        "md", "--format", "-f",
+        help="Output format: md (Markdown), json, or html",
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o",
+        help="Write report to this file. Defaults to report.md / report.json in the scan dir.",
+    ),
+    max_hops: int = typer.Option(5, "--max-hops", help="Max path length for attack surface graph"),
+    token_budget: int = typer.Option(
+        0, "--token-budget",
+        help="Cap the attack-surface text sent to Claude (rough tokens). "
+             "0 = no cap. 200000 is a reasonable default for very large accounts "
+             "(leaves room for the system prompt + response within Opus 4.7's 1M window). "
+             "ENTRY POINTS / SINKS / PATHS are always preserved in full; "
+             "ALL NODES / ALL EDGES sections truncate first.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Generate an LLM-powered attack-path report from a completed scan.
+
+    Requires the 'anthropic' package: pip install 'breakbot[llm]'
+    Set ANTHROPIC_API_KEY in your environment before running.
+    """
+    _configure_logging(verbose)
+
+    scan_file = scan_dir / "scan.json"
+    posture_file = scan_dir / "posture.json"
+
+    if not scan_file.exists():
+        console.print(f"[red]No scan.json found in {scan_dir}[/red]")
+        raise typer.Exit(1)
+
+    fmt = format.lower().strip()
+    if fmt not in {"md", "json", "html"}:
+        console.print(f"[red]Unknown format '{format}' — use md, json, or html[/red]")
+        raise typer.Exit(1)
+
+    # Load scan and build graph serialization
+    console.print(f"Loading scan from [bold]{scan_file}[/bold]")
+    result = ScanResult.model_validate_json(scan_file.read_text())
+    console.print(
+        f"Loaded {result.resource_count} resources across "
+        f"[yellow]{len(result.accounts_scanned)}[/yellow] account(s)"
+    )
+
+    console.print("[bold]Building dependency graph...[/bold]")
+    builder = GraphBuilder(result)
+    g = builder.build()
+
+    trail_file = scan_dir / "trail.json"
+    if trail_file.exists():
+        console.print("[bold]Applying CloudTrail behavioral overlay...[/bold]")
+        raw_events = json.loads(trail_file.read_text())
+        trail_events = [TrailEvent.from_dict(e) for e in raw_events]
+        behavioral_edges = TrailOverlay().apply(g, builder.arn_index, trail_events)
+        console.print(f"[green]✔[/green] {behavioral_edges} behavioral edge(s) added")
+
+    from breakbot.graph import GraphSerializer
+    serializer = GraphSerializer(g, builder.arn_index, max_hops=max_hops)
+    # tokens ≈ chars / 3 for English; 0 means no cap
+    max_chars = token_budget * 3 if token_budget > 0 else None
+    attack_surface = serializer.serialize(max_chars=max_chars)
+    if max_chars is not None and len(attack_surface) >= max_chars:
+        console.print(
+            f"[yellow]⚠ Attack surface truncated to fit ~{token_budget} tokens "
+            f"({len(attack_surface)} chars)[/yellow]"
+        )
+
+    # Load posture findings
+    posture_findings: list[dict] = []
+    if posture_file.exists():
+        posture_findings = json.loads(posture_file.read_text())
+        console.print(f"Loaded [yellow]{len(posture_findings)}[/yellow] posture finding(s)")
+    else:
+        console.print("[yellow]No posture.json found — run 'breakbot posture' first[/yellow]")
+
+    # Call Claude
+    try:
+        from breakbot.brain import SecurityAnalyst
+    except ImportError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+    console.print(f"\n[bold]Calling Claude (claude-opus-4-7) for threat analysis...[/bold]")
+    analyst = SecurityAnalyst()
+    analysis = analyst.analyze(attack_surface, posture_findings)
+
+    # Determine output path
+    ext_map = {"md": ".md", "json": ".json", "html": ".html"}
+    dest = output or (scan_dir / f"report{ext_map[fmt]}")
+
+    if fmt == "json":
+        dest.write_text(analysis.to_json(), encoding="utf-8")
+    elif fmt == "html":
+        dest.write_text(_report_to_html(analysis), encoding="utf-8")
+    else:
+        dest.write_text(analysis.to_markdown(), encoding="utf-8")
+
+    console.print(f"\n[green]✔[/green] Report written to [bold]{dest}[/bold]")
+    console.print(f"Overall severity: [bold red]{analysis.overall_severity}[/bold red]")
+    console.print(f"Attack paths identified: [bold]{len(analysis.attack_paths)}[/bold]")
+
+
+def _report_to_html(analysis: object) -> str:
+    """Minimal HTML wrapper around the Markdown report."""
+    import html as html_lib
+    from breakbot.brain.report import AnalysisReport
+
+    assert isinstance(analysis, AnalysisReport)
+    md = analysis.to_markdown()
+    escaped = html_lib.escape(md)
+    return (
+        "<!DOCTYPE html><html><head>"
+        "<meta charset='utf-8'>"
+        "<title>BreakBot Report</title>"
+        "<style>body{font-family:monospace;max-width:900px;margin:2em auto;padding:0 1em;"
+        "white-space:pre-wrap;line-height:1.5}</style>"
+        "</head><body>"
+        + escaped
+        + "</body></html>"
+    )
 
 
 if __name__ == "__main__":

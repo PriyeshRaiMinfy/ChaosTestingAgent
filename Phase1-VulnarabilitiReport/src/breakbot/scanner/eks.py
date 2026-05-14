@@ -1,20 +1,5 @@
 """
 EKS scanner — clusters, managed node groups, and Fargate profiles.
-
-Key properties for graph reasoning:
-  Cluster:
-    - cluster_role_arn       → IAM role the EKS control plane uses
-    - endpoint_public_access → public API server is a potential entry point
-    - vpc_id, security_group_ids → network placement for SG + VPC edges
-    - secrets_encrypted      → negative finding if etcd secrets are not KMS-wrapped
-    - logging_enabled        → negative finding if cluster logging is off
-
-  NodeGroup:
-    - node_role_arn          → IAM role attached to EC2 worker instances (critical
-                               escalation path: SSRF on any pod → node IMDS → role)
-
-  FargateProfile:
-    - pod_execution_role_arn → IAM role injected into every matching pod
 """
 from __future__ import annotations
 
@@ -24,6 +9,7 @@ from botocore.exceptions import ClientError
 
 from breakbot.models import Resource, ResourceType
 from breakbot.scanner.base import BaseScanner
+from breakbot.scanner.errors import ScanError, categorize
 
 logger = logging.getLogger(__name__)
 
@@ -32,33 +18,25 @@ class EksScanner(BaseScanner):
     domain = "eks"
 
     def _scan_region(self, region: str) -> list[Resource]:
+        return self._safe_scan_call(
+            "eks", "list_clusters", region, lambda: self._scan_clusters(region),
+        )
+
+    def _scan_clusters(self, region: str) -> list[Resource]:
         resources: list[Resource] = []
         eks = self.session.client("eks", region=region)
-
-        try:
-            cluster_names = _paginate(eks, "list_clusters", "clusters")
-        except ClientError as e:
-            logger.warning(
-                "EKS ListClusters failed in %s: %s", region, e.response["Error"]["Code"]
-            )
-            raise
+        cluster_names = _paginate(eks, "list_clusters", "clusters")
 
         for cluster_name in cluster_names:
             try:
                 cluster_resp = eks.describe_cluster(name=cluster_name)
-                cluster_resource = self._normalize_cluster(cluster_resp["cluster"], region)
-                resources.append(cluster_resource)
+                resources.append(self._normalize_cluster(cluster_resp["cluster"], region))
             except ClientError as e:
-                logger.warning(
-                    "DescribeCluster %s failed: %s", cluster_name, e.response["Error"]["Code"]
+                self._record_per_resource_error(
+                    operation=f"describe_cluster({cluster_name})",
+                    region=region,
+                    error=e,
                 )
-                self.errors.append({
-                    "domain": self.domain,
-                    "resource": cluster_name,
-                    "region": region,
-                    "error": str(e),
-                    "error_type": "EKSDescribeClusterFailed",
-                })
                 continue
 
             self._scan_nodegroups(eks, cluster_name, region, resources)
@@ -67,17 +45,13 @@ class EksScanner(BaseScanner):
         return resources
 
     def _scan_nodegroups(
-        self,
-        eks,
-        cluster_name: str,
-        region: str,
-        resources: list[Resource],
+        self, eks, cluster_name: str, region: str, resources: list[Resource],
     ) -> None:
         try:
             ng_names = _paginate(eks, "list_nodegroups", "nodegroups", clusterName=cluster_name)
         except ClientError as e:
-            logger.warning(
-                "ListNodegroups %s failed: %s", cluster_name, e.response["Error"]["Code"]
+            self._record_per_resource_error(
+                operation=f"list_nodegroups({cluster_name})", region=region, error=e,
             )
             return
 
@@ -90,27 +64,21 @@ class EksScanner(BaseScanner):
                     self._normalize_nodegroup(ng_resp["nodegroup"], cluster_name, region)
                 )
             except ClientError as e:
-                logger.warning(
-                    "DescribeNodegroup %s/%s failed: %s",
-                    cluster_name,
-                    ng_name,
-                    e.response["Error"]["Code"],
+                self._record_per_resource_error(
+                    operation=f"describe_nodegroup({cluster_name}/{ng_name})",
+                    region=region, error=e,
                 )
 
     def _scan_fargate_profiles(
-        self,
-        eks,
-        cluster_name: str,
-        region: str,
-        resources: list[Resource],
+        self, eks, cluster_name: str, region: str, resources: list[Resource],
     ) -> None:
         try:
             fp_names = _paginate(
                 eks, "list_fargate_profiles", "fargateProfileNames", clusterName=cluster_name
             )
         except ClientError as e:
-            logger.warning(
-                "ListFargateProfiles %s failed: %s", cluster_name, e.response["Error"]["Code"]
+            self._record_per_resource_error(
+                operation=f"list_fargate_profiles({cluster_name})", region=region, error=e,
             )
             return
 
@@ -125,12 +93,27 @@ class EksScanner(BaseScanner):
                     )
                 )
             except ClientError as e:
-                logger.warning(
-                    "DescribeFargateProfile %s/%s failed: %s",
-                    cluster_name,
-                    fp_name,
-                    e.response["Error"]["Code"],
+                self._record_per_resource_error(
+                    operation=f"describe_fargate_profile({cluster_name}/{fp_name})",
+                    region=region, error=e,
                 )
+
+    def _record_per_resource_error(self, operation: str, region: str, error: ClientError) -> None:
+        err = error.response.get("Error", {}) or {}
+        code = err.get("Code", "Unknown")
+        logger.warning("[%s] %s failed: %s", self.domain, operation, code)
+        self.errors.append(ScanError(
+            domain=self.domain,
+            account_id=self.session.account_id,
+            region=region,
+            service="eks",
+            operation=operation,
+            error_code=code,
+            error_type="ClientError",
+            message=err.get("Message", str(error)),
+            request_id=(error.response.get("ResponseMetadata") or {}).get("RequestId"),
+            category=categorize(code),
+        ).to_dict())
 
     # ───────────────────────── Normalizers ────────────────────────────────
 
@@ -188,9 +171,7 @@ class EksScanner(BaseScanner):
             properties=properties,
         )
 
-    def _normalize_nodegroup(
-        self, ng: dict, cluster_name: str, region: str
-    ) -> Resource:
+    def _normalize_nodegroup(self, ng: dict, cluster_name: str, region: str) -> Resource:
         arn = ng["nodegroupArn"]
         name = ng["nodegroupName"]
         tags = ng.get("tags", {})
@@ -253,7 +234,6 @@ class EksScanner(BaseScanner):
 
 
 def _paginate(client, method: str, key: str, **kwargs) -> list:
-    """Paginate any EKS list-* call and return the flat result list."""
     items: list = []
     paginator = client.get_paginator(method)
     for page in paginator.paginate(**kwargs):

@@ -79,18 +79,33 @@ class GraphSerializer:
 
     # ─────────────────────────── Public API ───────────────────────────────
 
-    def serialize(self) -> str:
-        """Return the full LLM-ready text representation."""
+    def serialize(self, max_chars: int | None = None) -> str:
+        """
+        Return the LLM-ready text representation.
+
+        Args:
+            max_chars: optional upper bound on output size. When set, ALL NODES
+                and ALL EDGES sections are truncated to fit, while ENTRY POINTS,
+                SENSITIVE SINKS, and ATTACK SURFACE PATHS are always preserved
+                in full (they're the high-signal sections — a truncated path
+                section would defeat the purpose).
+
+                Rough heuristic: tokens ≈ chars / 3 for English. For a 200K-token
+                user-message budget on Claude Opus 4.7, pass max_chars ≈ 600_000.
+        """
         buf = StringIO()
 
         entry_points = self._find_entry_points()
         sinks = self._find_sinks()
 
+        # Bounded, always-rendered sections
         self._write_entry_points(buf, entry_points)
         self._write_sinks(buf, sinks)
         self._write_attack_paths(buf, entry_points, sinks)
-        self._write_all_nodes(buf)
-        self._write_all_edges(buf)
+
+        # Unbounded sections — can be truncated under a budget
+        self._write_all_nodes(buf, remaining=_remaining(max_chars, buf))
+        self._write_all_edges(buf, remaining=_remaining(max_chars, buf))
 
         return buf.getvalue()
 
@@ -206,12 +221,18 @@ class GraphSerializer:
                 except nx.NetworkXError:
                     continue
 
-                for path in paths[:3]:  # cap at 3 paths per (src, dst) pair
+                # Rank paths by risk-weighted score and take the top 3 per pair.
+                # The arbitrary [:3] truncation we used before dropped real
+                # attack chains when there were many low-quality candidates.
+                ranked = self._rank_paths(paths)
+
+                for path, _score, markers in ranked[:3]:
                     path_count += 1
                     node_chain = "  →  ".join(
                         self.graph.nodes[n].get("name", n) for n in path
                     )
-                    buf.write(f"\nPATH {path_count}: {node_chain}\n")
+                    marker_str = (" [" + " ".join(markers) + "]") if markers else ""
+                    buf.write(f"\nPATH {path_count}{marker_str}: {node_chain}\n")
                     for i in range(len(path) - 1):
                         u, v = path[i], path[i + 1]
                         for edge_attrs in self.graph[u][v].values():
@@ -221,19 +242,99 @@ class GraphSerializer:
             buf.write("  (no paths found between entry points and sinks)\n")
         buf.write("\n")
 
-    def _write_all_nodes(self, buf: StringIO) -> None:
+    # ───────────────────────── Path ranking ───────────────────────────────
+
+    def _rank_paths(
+        self, paths: list[list[str]]
+    ) -> list[tuple[list[str], int, list[str]]]:
+        """
+        Score each path and return [(path, score, markers), ...] sorted by
+        score descending. `markers` is a small set of headline tags
+        (ADMIN, WILDCARD, CONFIRMED, WEAK) that surface what makes the
+        path notable without re-parsing the edge list.
+
+        Scoring rationale:
+            +5  per behavioral edge   ← CloudTrail-confirmed; not theoretical
+            +3  per admin edge        ← is_admin=True
+            +2  per wildcard edge     ← is_wildcard_resource=True
+            -2  per conditional edge  ← has_conditions=True (weaker exploit)
+            -1  per edge (length)     ← shorter paths preferred
+        """
+        scored: list[tuple[list[str], int, list[str]]] = []
+        for path in paths:
+            score = 0
+            wildcard_count = 0
+            admin_count = 0
+            behavioral_count = 0
+            conditional_count = 0
+
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i + 1]
+                score -= 1  # path length penalty per hop
+                for attrs in self.graph[u][v].values():
+                    if attrs.get("is_behavioral"):
+                        score += 5
+                        behavioral_count += 1
+                    if attrs.get("is_admin"):
+                        score += 3
+                        admin_count += 1
+                    if attrs.get("is_wildcard_resource"):
+                        score += 2
+                        wildcard_count += 1
+                    if attrs.get("has_conditions"):
+                        score -= 2
+                        conditional_count += 1
+
+            markers: list[str] = []
+            if behavioral_count:
+                markers.append("CONFIRMED")
+            if admin_count:
+                markers.append("ADMIN")
+            if wildcard_count:
+                markers.append("WILDCARD")
+            if conditional_count and not behavioral_count:
+                # CONFIRMED behavioral edges trump the WEAK marker —
+                # a path that actually happened isn't weakened by a Condition.
+                markers.append("WEAK")
+
+            scored.append((path, score, markers))
+
+        # Stable sort by score desc, then by length asc, then by string
+        # repr of path for determinism in tests.
+        scored.sort(key=lambda t: (-t[1], len(t[0]), str(t[0])))
+        return scored
+
+    def _write_all_nodes(self, buf: StringIO, remaining: int | None = None) -> None:
         buf.write("=== ALL NODES ===\n")
-        for node_id, attrs in sorted(self.graph.nodes(data=True)):
-            buf.write(f"  {self._node_line(node_id)}\n")
+        total = self.graph.number_of_nodes()
+        written = 0
+        for node_id, _attrs in sorted(self.graph.nodes(data=True)):
+            line = f"  {self._node_line(node_id)}\n"
+            if remaining is not None and len(line) > remaining:
+                buf.write(f"  [truncated: {written} of {total} nodes shown — budget exhausted]\n")
+                break
+            buf.write(line)
+            if remaining is not None:
+                remaining -= len(line)
+            written += 1
         buf.write("\n")
 
-    def _write_all_edges(self, buf: StringIO) -> None:
+    def _write_all_edges(self, buf: StringIO, remaining: int | None = None) -> None:
         buf.write("=== ALL EDGES ===\n")
+        total = self.graph.number_of_edges()
+        written = 0
         for u, v, attrs in sorted(
             self.graph.edges(data=True),
             key=lambda e: (e[0], e[1]),
         ):
-            buf.write(f"  {self._edge_line(u, v, attrs)}\n")
+            line = f"  {self._edge_line(u, v, attrs)}\n"
+            if remaining is not None and len(line) > remaining:
+                buf.write(f"  [truncated: {written} of {total} edges shown — budget exhausted]\n")
+                break
+            buf.write(line)
+            if remaining is not None:
+                remaining -= len(line)
+            written += 1
         buf.write("\n")
 
     # ──────────────────────── Line Formatters ─────────────────────────────
@@ -322,6 +423,13 @@ class GraphSerializer:
 
 
 # ─────────────────────────── Module helpers ───────────────────────────────
+
+
+def _remaining(max_chars: int | None, buf: StringIO) -> int | None:
+    """Chars left in the buffer's budget. None = unlimited (no truncation)."""
+    if max_chars is None:
+        return None
+    return max(0, max_chars - len(buf.getvalue()))
 
 
 def _kv(parts: list[str], key: str, value: object) -> None:
