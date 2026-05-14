@@ -24,6 +24,7 @@ from botocore.exceptions import ClientError
 
 from breakbot.models import Resource, ResourceType
 from breakbot.scanner.base import BaseScanner
+from breakbot.scanner.errors import ScanError, categorize
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +40,16 @@ class IdentityScanner(BaseScanner):
         self._policy_doc_cache: dict[str, dict | None] = {}
 
     def _scan_region(self, region: str) -> list[Resource]:
+        # Roles and Users are isolated — Users still scans if Roles fails.
         resources: list[Resource] = []
-        resources.extend(self._scan_roles())
-        resources.extend(self._scan_users())
+        resources.extend(self._safe_scan_call(
+            "iam", "list_roles", region,
+            lambda: self._scan_roles(),
+        ))
+        resources.extend(self._safe_scan_call(
+            "iam", "list_users", region,
+            lambda: self._scan_users(),
+        ))
         return resources
 
     # ──────────────────────────── Roles ─────────────────────────────────
@@ -52,29 +60,25 @@ class IdentityScanner(BaseScanner):
           - assume_role_policy (trust policy)
           - attached managed policies (names + ARNs)
           - inline policies (full documents)
+
+        Errors from list_roles itself propagate up to _safe_scan_call.
+        Per-role inspection errors are isolated below so one bad role
+        doesn't lose the rest.
         """
         iam = self.session.client("iam", region="us-east-1")
         paginator = iam.get_paginator("list_roles")
 
         resources = []
-        try:
-            for page in paginator.paginate():
-                for role in page["Roles"]:
-                    try:
-                        resources.append(self._inspect_role(role))
-                    except ClientError as e:
-                        logger.warning(
-                            "Role %s inspection failed: %s",
-                            role["RoleName"], e.response["Error"]["Code"],
-                        )
-                        self.errors.append({
-                            "domain": self.domain,
-                            "resource": role["RoleName"],
-                            "error": str(e),
-                        })
-        except ClientError as e:
-            logger.warning("list_roles failed: %s", e.response["Error"]["Code"])
-            raise
+        for page in paginator.paginate():
+            for role in page["Roles"]:
+                try:
+                    resources.append(self._inspect_role(role))
+                except ClientError as e:
+                    self._record_per_resource_error(
+                        operation="get_role_policy",
+                        resource_name=role.get("RoleName", "?"),
+                        error=e,
+                    )
         return resources
 
     def _inspect_role(self, role: dict) -> Resource:
@@ -86,8 +90,9 @@ class IdentityScanner(BaseScanner):
         if isinstance(trust_policy, str):
             trust_policy = json.loads(unquote(trust_policy))
 
-        # Attached managed policies — fetch each policy's default version document
-        # so the graph builder can construct iam_can_access edges without extra calls.
+        # Attached managed policies — fetch each policy's default version
+        # document so the graph builder can construct iam_can_access edges
+        # without extra calls.
         attached = iam.list_attached_role_policies(RoleName=role_name)
         managed_policies = []
         for p in attached.get("AttachedPolicies", []):
@@ -170,26 +175,22 @@ class IdentityScanner(BaseScanner):
         paginator = iam.get_paginator("list_users")
 
         resources = []
-        try:
-            for page in paginator.paginate():
-                for user in page["Users"]:
-                    try:
-                        resources.append(self._inspect_user(user))
-                    except ClientError as e:
-                        logger.warning(
-                            "User %s inspection failed: %s",
-                            user["UserName"], e.response["Error"]["Code"],
-                        )
-        except ClientError as e:
-            logger.warning("list_users failed: %s", e.response["Error"]["Code"])
-            raise
+        for page in paginator.paginate():
+            for user in page["Users"]:
+                try:
+                    resources.append(self._inspect_user(user))
+                except ClientError as e:
+                    self._record_per_resource_error(
+                        operation="list_access_keys",
+                        resource_name=user.get("UserName", "?"),
+                        error=e,
+                    )
         return resources
 
     def _inspect_user(self, user: dict) -> Resource:
         iam = self.session.client("iam", region="us-east-1")
         user_name = user["UserName"]
 
-        # Access keys — metadata only (we never see secrets)
         access_keys = iam.list_access_keys(UserName=user_name).get("AccessKeyMetadata", [])
         keys = [
             {
@@ -200,10 +201,7 @@ class IdentityScanner(BaseScanner):
             for k in access_keys
         ]
 
-        # MFA devices
         mfa = iam.list_mfa_devices(UserName=user_name).get("MFADevices", [])
-
-        # Group memberships
         groups = iam.list_groups_for_user(UserName=user_name).get("Groups", [])
 
         properties = {
@@ -225,3 +223,31 @@ class IdentityScanner(BaseScanner):
             account_id=self.session.account_id,
             properties=properties,
         )
+
+    # ──────────────────────── Per-resource errors ────────────────────────
+
+    def _record_per_resource_error(
+        self, operation: str, resource_name: str, error: ClientError,
+    ) -> None:
+        """Record a structured error for a single role/user inspection failure."""
+        err = error.response.get("Error", {}) or {}
+        code = err.get("Code", "Unknown")
+        message = err.get("Message", str(error))
+        request_id = (error.response.get("ResponseMetadata") or {}).get("RequestId")
+
+        logger.warning(
+            "[%s] %s on %s failed: %s",
+            self.domain, operation, resource_name, code,
+        )
+        self.errors.append(ScanError(
+            domain=self.domain,
+            account_id=self.session.account_id,
+            region="global",
+            service="iam",
+            operation=f"{operation}({resource_name})",
+            error_code=code,
+            error_type="ClientError",
+            message=message,
+            request_id=request_id,
+            category=categorize(code),
+        ).to_dict())

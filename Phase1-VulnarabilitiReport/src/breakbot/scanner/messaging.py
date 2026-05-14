@@ -1,14 +1,5 @@
 """
 Messaging and streaming scanner — SQS, SNS, MSK (Kafka), and Kinesis Data Streams.
-
-Key security properties:
-  SQS:    queue policy with Principal:* = data exfiltration/injection vector;
-          no KMS encryption = sensitive messages in plaintext
-  SNS:    topic policy with Principal:* = anyone can publish or subscribe;
-          no KMS = message content exposed
-  MSK:    client_broker = PLAINTEXT or TLS_PLAINTEXT = traffic unencrypted;
-          unauthenticated_access_enabled = no auth required
-  Kinesis: encryption_type = NONE = stream data unencrypted at rest
 """
 from __future__ import annotations
 
@@ -28,10 +19,18 @@ class MessagingScanner(BaseScanner):
 
     def _scan_region(self, region: str) -> list[Resource]:
         resources: list[Resource] = []
-        resources.extend(self._scan_sqs(region))
-        resources.extend(self._scan_sns(region))
-        resources.extend(self._scan_msk(region))
-        resources.extend(self._scan_kinesis(region))
+        resources.extend(self._safe_scan_call(
+            "sqs", "list_queues", region, lambda: self._scan_sqs(region),
+        ))
+        resources.extend(self._safe_scan_call(
+            "sns", "list_topics", region, lambda: self._scan_sns(region),
+        ))
+        resources.extend(self._safe_scan_call(
+            "kafka", "list_clusters", region, lambda: self._scan_msk(region),
+        ))
+        resources.extend(self._safe_scan_call(
+            "kinesis", "list_streams", region, lambda: self._scan_kinesis(region),
+        ))
         return resources
 
     # ─────────────────────────── SQS ─────────────────────────────────────
@@ -40,15 +39,10 @@ class MessagingScanner(BaseScanner):
         sqs = self.session.client("sqs", region=region)
         resources: list[Resource] = []
         queue_urls: list[str] = []
-        try:
-            paginator = sqs.get_paginator("list_queues")
-            for page in paginator.paginate():
-                queue_urls.extend(page.get("QueueUrls", []))
-        except ClientError as e:
-            logger.warning(
-                "SQS ListQueues failed in %s: %s", region, e.response["Error"]["Code"]
-            )
-            raise
+
+        paginator = sqs.get_paginator("list_queues")
+        for page in paginator.paginate():
+            queue_urls.extend(page.get("QueueUrls", []))
 
         for url in queue_urls:
             try:
@@ -59,8 +53,12 @@ class MessagingScanner(BaseScanner):
             except ClientError as e:
                 logger.warning(
                     "SQS GetQueueAttributes failed for %s: %s",
-                    url.split("/")[-1],
-                    e.response["Error"]["Code"],
+                    url.split("/")[-1], e.response["Error"]["Code"],
+                )
+            except Exception as e:
+                logger.warning(
+                    "[messaging] failed to normalize SQS queue %s: %s",
+                    url.split("/")[-1], e,
                 )
         return resources
 
@@ -102,27 +100,25 @@ class MessagingScanner(BaseScanner):
     def _scan_sns(self, region: str) -> list[Resource]:
         sns = self.session.client("sns", region=region)
         resources: list[Resource] = []
-        try:
-            paginator = sns.get_paginator("list_topics")
-            for page in paginator.paginate():
-                for topic in page.get("Topics", []):
-                    arn = topic["TopicArn"]
-                    try:
-                        resp = sns.get_topic_attributes(TopicArn=arn)
-                        resources.append(
-                            self._normalize_topic(arn, resp.get("Attributes", {}), region)
-                        )
-                    except ClientError as e:
-                        logger.warning(
-                            "SNS GetTopicAttributes %s failed: %s",
-                            arn.split(":")[-1],
-                            e.response["Error"]["Code"],
-                        )
-        except ClientError as e:
-            logger.warning(
-                "SNS ListTopics failed in %s: %s", region, e.response["Error"]["Code"]
-            )
-            raise
+        paginator = sns.get_paginator("list_topics")
+        for page in paginator.paginate():
+            for topic in page.get("Topics", []):
+                arn = topic["TopicArn"]
+                try:
+                    resp = sns.get_topic_attributes(TopicArn=arn)
+                    resources.append(
+                        self._normalize_topic(arn, resp.get("Attributes", {}), region)
+                    )
+                except ClientError as e:
+                    logger.warning(
+                        "SNS GetTopicAttributes %s failed: %s",
+                        arn.split(":")[-1], e.response["Error"]["Code"],
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[messaging] failed to normalize SNS topic %s: %s",
+                        arn.split(":")[-1], e,
+                    )
         return resources
 
     def _normalize_topic(self, arn: str, attrs: dict, region: str) -> Resource:
@@ -157,16 +153,16 @@ class MessagingScanner(BaseScanner):
     def _scan_msk(self, region: str) -> list[Resource]:
         kafka = self.session.client("kafka", region=region)
         resources: list[Resource] = []
-        try:
-            paginator = kafka.get_paginator("list_clusters")
-            for page in paginator.paginate():
-                for cluster in page.get("ClusterInfoList", []):
+        paginator = kafka.get_paginator("list_clusters")
+        for page in paginator.paginate():
+            for cluster in page.get("ClusterInfoList", []):
+                try:
                     resources.append(self._normalize_msk_cluster(cluster, region))
-        except ClientError as e:
-            logger.warning(
-                "MSK ListClusters failed in %s: %s", region, e.response["Error"]["Code"]
-            )
-            raise
+                except Exception as e:
+                    logger.warning(
+                        "[messaging] failed to normalize MSK cluster %s: %s",
+                        cluster.get("ClusterName", "?"), e,
+                    )
         return resources
 
     def _normalize_msk_cluster(self, cluster: dict, region: str) -> Resource:
@@ -224,21 +220,14 @@ class MessagingScanner(BaseScanner):
         kinesis = self.session.client("kinesis", region=region)
         resources: list[Resource] = []
         stream_names: list[str] = []
-        try:
-            paginator = kinesis.get_paginator("list_streams")
-            for page in paginator.paginate():
-                # Newer API: StreamSummaries with ARNs
-                for summary in page.get("StreamSummaries", []):
-                    stream_names.append(summary["StreamName"])
-                # Older API fallback: StreamNames only
-                for name in page.get("StreamNames", []):
-                    if name not in stream_names:
-                        stream_names.append(name)
-        except ClientError as e:
-            logger.warning(
-                "Kinesis ListStreams failed in %s: %s", region, e.response["Error"]["Code"]
-            )
-            raise
+
+        paginator = kinesis.get_paginator("list_streams")
+        for page in paginator.paginate():
+            for summary in page.get("StreamSummaries", []):
+                stream_names.append(summary["StreamName"])
+            for name in page.get("StreamNames", []):
+                if name not in stream_names:
+                    stream_names.append(name)
 
         for stream_name in stream_names:
             try:
@@ -248,8 +237,12 @@ class MessagingScanner(BaseScanner):
             except ClientError as e:
                 logger.warning(
                     "DescribeStreamSummary %s failed: %s",
-                    stream_name,
-                    e.response["Error"]["Code"],
+                    stream_name, e.response["Error"]["Code"],
+                )
+            except Exception as e:
+                logger.warning(
+                    "[messaging] failed to normalize Kinesis stream %s: %s",
+                    stream_name, e,
                 )
         return resources
 
@@ -294,7 +287,6 @@ def _parse_json_attr(value: str | None) -> dict | None:
 
 
 def _policy_allows_public_access(policy: dict | None) -> bool:
-    """True if the policy has an Allow statement with Principal: * (no condition)."""
     if not policy:
         return False
     for stmt in policy.get("Statement", []):

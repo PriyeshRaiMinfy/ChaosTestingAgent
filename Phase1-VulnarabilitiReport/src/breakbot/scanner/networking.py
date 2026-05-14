@@ -9,24 +9,16 @@ references without re-parsing AWS-shaped JSON.
 ALBs matter because they're the most common internet-facing entry point.
 A public ALB pointing at a Lambda or EC2 target is the start of many attack
 chains.
-
-NAT Gateways show which private subnets have outbound internet access — relevant
-for data-exfiltration paths.
-
-Internet Gateways mark which VPCs have direct two-way internet connectivity.
 """
 from __future__ import annotations
 
 import logging
-
-from botocore.exceptions import ClientError
 
 from breakbot.models import Resource, ResourceType
 from breakbot.scanner.base import BaseScanner
 
 logger = logging.getLogger(__name__)
 
-# A CIDR like 0.0.0.0/0 in an ingress rule = open to the public internet.
 INTERNET_CIDR = "0.0.0.0/0"
 
 
@@ -35,64 +27,78 @@ class NetworkingScanner(BaseScanner):
 
     def _scan_region(self, region: str) -> list[Resource]:
         resources: list[Resource] = []
-        resources.extend(self._scan_vpcs(region))
-        resources.extend(self._scan_security_groups(region))
-        resources.extend(self._scan_albs(region))
-        resources.extend(self._scan_target_groups(region))
-        resources.extend(self._scan_nat_gateways(region))
-        resources.extend(self._scan_internet_gateways(region))
+        resources.extend(self._safe_scan_call(
+            "ec2", "describe_vpcs", region, lambda: self._scan_vpcs(region),
+        ))
+        resources.extend(self._safe_scan_call(
+            "ec2", "describe_security_groups", region, lambda: self._scan_security_groups(region),
+        ))
+        resources.extend(self._safe_scan_call(
+            "elbv2", "describe_load_balancers", region, lambda: self._scan_albs(region),
+        ))
+        resources.extend(self._safe_scan_call(
+            "elbv2", "describe_target_groups", region, lambda: self._scan_target_groups(region),
+        ))
+        resources.extend(self._safe_scan_call(
+            "ec2", "describe_nat_gateways", region, lambda: self._scan_nat_gateways(region),
+        ))
+        resources.extend(self._safe_scan_call(
+            "ec2", "describe_internet_gateways", region, lambda: self._scan_internet_gateways(region),
+        ))
         return resources
 
     # ──────────────────────────── VPCs ──────────────────────────────────
 
     def _scan_vpcs(self, region: str) -> list[Resource]:
         ec2 = self.session.client("ec2", region=region)
-        try:
-            response = ec2.describe_vpcs()
-        except ClientError as e:
-            logger.warning("VPC scan failed in %s: %s", region, e.response["Error"]["Code"])
-            raise
+        response = ec2.describe_vpcs()
 
         resources = []
         for vpc in response["Vpcs"]:
-            vpc_id = vpc["VpcId"]
-            arn = f"arn:aws:ec2:{region}:{self.session.account_id}:vpc/{vpc_id}"
-            tags = {t["Key"]: t["Value"] for t in vpc.get("Tags", [])}
-            resources.append(Resource(
-                arn=arn,
-                resource_type=ResourceType.VPC,
-                name=tags.get("Name", vpc_id),
-                region=region,
-                account_id=self.session.account_id,
-                tags=tags,
-                properties={
-                    "vpc_id": vpc_id,
-                    "cidr_block": vpc.get("CidrBlock"),
-                    "is_default": vpc.get("IsDefault", False),
-                    "state": vpc.get("State"),
-                },
-            ))
+            try:
+                resources.append(self._normalize_vpc(vpc, region))
+            except Exception as e:
+                logger.warning(
+                    "[networking] failed to normalize VPC %s: %s",
+                    vpc.get("VpcId", "?"), e,
+                )
         return resources
+
+    def _normalize_vpc(self, vpc: dict, region: str) -> Resource:
+        vpc_id = vpc["VpcId"]
+        arn = f"arn:aws:ec2:{region}:{self.session.account_id}:vpc/{vpc_id}"
+        tags = {t["Key"]: t["Value"] for t in vpc.get("Tags", [])}
+        return Resource(
+            arn=arn,
+            resource_type=ResourceType.VPC,
+            name=tags.get("Name", vpc_id),
+            region=region,
+            account_id=self.session.account_id,
+            tags=tags,
+            properties={
+                "vpc_id": vpc_id,
+                "cidr_block": vpc.get("CidrBlock"),
+                "is_default": vpc.get("IsDefault", False),
+                "state": vpc.get("State"),
+            },
+        )
 
     # ──────────────────────── Security Groups ───────────────────────────
 
     def _scan_security_groups(self, region: str) -> list[Resource]:
-        """
-        Capture ingress rules in a structured form. Each rule will become a
-        graph edge in Phase 4. We flag `internet_exposed` here so the graph
-        builder can quickly find entry points without reparsing rules.
-        """
         ec2 = self.session.client("ec2", region=region)
         paginator = ec2.get_paginator("describe_security_groups")
 
         resources = []
-        try:
-            for page in paginator.paginate():
-                for sg in page["SecurityGroups"]:
+        for page in paginator.paginate():
+            for sg in page["SecurityGroups"]:
+                try:
                     resources.append(self._normalize_sg(sg, region))
-        except ClientError as e:
-            logger.warning("SG scan failed in %s: %s", region, e.response["Error"]["Code"])
-            raise
+                except Exception as e:
+                    logger.warning(
+                        "[networking] failed to normalize SG %s: %s",
+                        sg.get("GroupId", "?"), e,
+                    )
         return resources
 
     def _normalize_sg(self, sg: dict, region: str) -> Resource:
@@ -102,10 +108,7 @@ class NetworkingScanner(BaseScanner):
         ingress_rules = [self._parse_rule(r) for r in sg.get("IpPermissions", [])]
         egress_rules = [self._parse_rule(r) for r in sg.get("IpPermissionsEgress", [])]
 
-        # Flag: any ingress rule open to 0.0.0.0/0
-        internet_exposed = any(
-            INTERNET_CIDR in r["cidrs"] for r in ingress_rules
-        )
+        internet_exposed = any(INTERNET_CIDR in r["cidrs"] for r in ingress_rules)
 
         properties = {
             "group_id": sg_id,
@@ -129,7 +132,6 @@ class NetworkingScanner(BaseScanner):
 
     @staticmethod
     def _parse_rule(rule: dict) -> dict:
-        """Flatten an AWS IpPermission into a clean rule dict."""
         return {
             "protocol": rule.get("IpProtocol"),
             "from_port": rule.get("FromPort"),
@@ -148,13 +150,15 @@ class NetworkingScanner(BaseScanner):
         paginator = elbv2.get_paginator("describe_load_balancers")
 
         resources = []
-        try:
-            for page in paginator.paginate():
-                for lb in page["LoadBalancers"]:
+        for page in paginator.paginate():
+            for lb in page["LoadBalancers"]:
+                try:
                     resources.append(self._normalize_alb(lb, region))
-        except ClientError as e:
-            logger.warning("ALB scan failed in %s: %s", region, e.response["Error"]["Code"])
-            raise
+                except Exception as e:
+                    logger.warning(
+                        "[networking] failed to normalize LB %s: %s",
+                        lb.get("LoadBalancerName", "?"), e,
+                    )
         return resources
 
     def _normalize_alb(self, lb: dict, region: str) -> Resource:
@@ -173,7 +177,6 @@ class NetworkingScanner(BaseScanner):
             "vpc_id": lb.get("VpcId"),
             "dns_name": lb.get("DNSName"),
             "availability_zones": [az["ZoneName"] for az in lb.get("AvailabilityZones", [])],
-            # NLBs do not use security groups; this will be empty for them
             "security_group_ids": lb.get("SecurityGroups", []),
             "state": lb.get("State", {}).get("Code"),
         }
@@ -193,15 +196,15 @@ class NetworkingScanner(BaseScanner):
         elbv2 = self.session.client("elbv2", region=region)
         paginator = elbv2.get_paginator("describe_target_groups")
         resources: list[Resource] = []
-        try:
-            for page in paginator.paginate():
-                for tg in page.get("TargetGroups", []):
+        for page in paginator.paginate():
+            for tg in page.get("TargetGroups", []):
+                try:
                     resources.append(self._normalize_target_group(tg, region))
-        except ClientError as e:
-            logger.warning(
-                "Target group scan failed in %s: %s",
-                region, e.response["Error"]["Code"],
-            )
+                except Exception as e:
+                    logger.warning(
+                        "[networking] failed to normalize target group %s: %s",
+                        tg.get("TargetGroupName", "?"), e,
+                    )
         return resources
 
     def _normalize_target_group(self, tg: dict, region: str) -> Resource:
@@ -210,10 +213,10 @@ class NetworkingScanner(BaseScanner):
 
         properties = {
             "target_group_name": name,
-            "protocol": tg.get("Protocol"),          # HTTP, HTTPS, TCP, TLS, UDP, TCP_UDP, GENEVE
+            "protocol": tg.get("Protocol"),
             "port": tg.get("Port"),
             "vpc_id": tg.get("VpcId"),
-            "target_type": tg.get("TargetType"),     # instance, ip, lambda, alb
+            "target_type": tg.get("TargetType"),
             "health_check_enabled": tg.get("HealthCheckEnabled", True),
             "health_check_protocol": tg.get("HealthCheckProtocol"),
             "health_check_port": tg.get("HealthCheckPort"),
@@ -235,16 +238,17 @@ class NetworkingScanner(BaseScanner):
         ec2 = self.session.client("ec2", region=region)
         paginator = ec2.get_paginator("describe_nat_gateways")
         resources: list[Resource] = []
-        try:
-            for page in paginator.paginate(
-                Filter=[{"Name": "state", "Values": ["available", "pending"]}]
-            ):
-                for ngw in page.get("NatGateways", []):
+        for page in paginator.paginate(
+            Filter=[{"Name": "state", "Values": ["available", "pending"]}]
+        ):
+            for ngw in page.get("NatGateways", []):
+                try:
                     resources.append(self._normalize_nat_gateway(ngw, region))
-        except ClientError as e:
-            logger.warning(
-                "NAT Gateway scan failed in %s: %s", region, e.response["Error"]["Code"]
-            )
+                except Exception as e:
+                    logger.warning(
+                        "[networking] failed to normalize NAT gateway %s: %s",
+                        ngw.get("NatGatewayId", "?"), e,
+                    )
         return resources
 
     def _normalize_nat_gateway(self, ngw: dict, region: str) -> Resource:
@@ -282,14 +286,15 @@ class NetworkingScanner(BaseScanner):
         ec2 = self.session.client("ec2", region=region)
         paginator = ec2.get_paginator("describe_internet_gateways")
         resources: list[Resource] = []
-        try:
-            for page in paginator.paginate():
-                for igw in page.get("InternetGateways", []):
+        for page in paginator.paginate():
+            for igw in page.get("InternetGateways", []):
+                try:
                     resources.append(self._normalize_internet_gateway(igw, region))
-        except ClientError as e:
-            logger.warning(
-                "IGW scan failed in %s: %s", region, e.response["Error"]["Code"]
-            )
+                except Exception as e:
+                    logger.warning(
+                        "[networking] failed to normalize IGW %s: %s",
+                        igw.get("InternetGatewayId", "?"), e,
+                    )
         return resources
 
     def _normalize_internet_gateway(self, igw: dict, region: str) -> Resource:
@@ -304,7 +309,6 @@ class NetworkingScanner(BaseScanner):
             "internet_gateway_id": igw_id,
             "attached_vpc_ids": attached_vpc_ids,
             "is_attached": bool(attached_vpc_ids),
-            # Store first VPC so the builder's in_vpc logic picks it up
             "vpc_id": attached_vpc_ids[0] if attached_vpc_ids else None,
         }
 

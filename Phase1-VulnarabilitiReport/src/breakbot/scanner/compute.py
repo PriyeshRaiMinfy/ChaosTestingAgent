@@ -21,8 +21,6 @@ from __future__ import annotations
 
 import logging
 
-from botocore.exceptions import ClientError
-
 from breakbot.models import Resource, ResourceType
 from breakbot.scanner.base import BaseScanner
 
@@ -33,30 +31,40 @@ class ComputeScanner(BaseScanner):
     domain = "compute"
 
     def _scan_region(self, region: str) -> list[Resource]:
+        # Each service call is isolated — Lambda still scans even if EC2 fails.
         resources: list[Resource] = []
-        resources.extend(self._scan_ec2(region))
-        resources.extend(self._scan_lambda(region))
+        resources.extend(self._safe_scan_call(
+            "ec2", "describe_instances", region,
+            lambda: self._scan_ec2(region),
+        ))
+        resources.extend(self._safe_scan_call(
+            "lambda", "list_functions", region,
+            lambda: self._scan_lambda(region),
+        ))
         return resources
 
     # ─────────────────────────────── EC2 ──────────────────────────────────
 
     def _scan_ec2(self, region: str) -> list[Resource]:
         """
-        Enumerate EC2 instances with paginator (handles accounts with 1000+ instances).
+        Enumerate EC2 instances. Pagination handles accounts with 1000+ instances.
+        Errors from describe_instances itself propagate up to _safe_scan_call.
+        Errors from normalizing individual instances are isolated per-instance.
         """
         ec2 = self.session.client("ec2", region=region)
         paginator = ec2.get_paginator("describe_instances")
 
         resources: list[Resource] = []
-        try:
-            for page in paginator.paginate():
-                for reservation in page["Reservations"]:
-                    for instance in reservation["Instances"]:
+        for page in paginator.paginate():
+            for reservation in page["Reservations"]:
+                for instance in reservation["Instances"]:
+                    try:
                         resources.append(self._normalize_ec2(instance, region))
-        except ClientError as e:
-            # opt-in regions, disabled regions, etc.
-            logger.warning("EC2 scan failed in %s: %s", region, e.response["Error"]["Code"])
-            raise
+                    except Exception as e:
+                        logger.warning(
+                            "[compute] failed to normalize EC2 %s in %s: %s",
+                            instance.get("InstanceId", "?"), region, e,
+                        )
         return resources
 
     def _normalize_ec2(self, instance: dict, region: str) -> Resource:
@@ -64,11 +72,10 @@ class ComputeScanner(BaseScanner):
         instance_id = instance["InstanceId"]
         arn = f"arn:aws:ec2:{region}:{self.session.account_id}:instance/{instance_id}"
 
-        # Tags come as [{Key, Value}, ...] — flatten to dict
         tags = {t["Key"]: t["Value"] for t in instance.get("Tags", [])}
         name = tags.get("Name", instance_id)
 
-        # IMDS metadata options — IMDSv1 enabled is a finding
+        # IMDSv1 enabled is a posture finding
         metadata_opts = instance.get("MetadataOptions", {})
         imds_v1_allowed = metadata_opts.get("HttpTokens") != "required"
 
@@ -102,20 +109,23 @@ class ComputeScanner(BaseScanner):
 
     def _scan_lambda(self, region: str) -> list[Resource]:
         """
-        Enumerate Lambda functions. Environment variables are captured for the
-        secrets scanner to inspect — we do not log or redact them here.
+        Enumerate Lambda functions. Environment variable values pass through
+        to the secrets scanner — we keep keys and value-existence only at
+        this layer.
         """
         lam = self.session.client("lambda", region=region)
         paginator = lam.get_paginator("list_functions")
 
         resources: list[Resource] = []
-        try:
-            for page in paginator.paginate():
-                for fn in page["Functions"]:
+        for page in paginator.paginate():
+            for fn in page["Functions"]:
+                try:
                     resources.append(self._normalize_lambda(fn, region))
-        except ClientError as e:
-            logger.warning("Lambda scan failed in %s: %s", region, e.response["Error"]["Code"])
-            raise
+                except Exception as e:
+                    logger.warning(
+                        "[compute] failed to normalize Lambda %s in %s: %s",
+                        fn.get("FunctionName", "?"), region, e,
+                    )
         return resources
 
     def _normalize_lambda(self, fn: dict, region: str) -> Resource:
@@ -137,7 +147,7 @@ class ComputeScanner(BaseScanner):
             "security_group_ids": vpc_config.get("SecurityGroupIds", []),
             "in_vpc": bool(vpc_config.get("VpcId")),
             "env_var_count": len(env_vars),
-            "env_var_keys": list(env_vars.keys()),  # keys only — values to secrets scanner
+            "env_var_keys": list(env_vars.keys()),
             "layers": [l["Arn"] for l in fn.get("Layers", [])],
             "last_modified": fn.get("LastModified"),
         }

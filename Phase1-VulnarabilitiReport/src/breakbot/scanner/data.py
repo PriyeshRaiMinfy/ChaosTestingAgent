@@ -19,6 +19,7 @@ from botocore.exceptions import ClientError
 
 from breakbot.models import Resource, ResourceType
 from breakbot.scanner.base import BaseScanner
+from breakbot.scanner.errors import ScanError, categorize
 
 logger = logging.getLogger(__name__)
 
@@ -36,49 +37,52 @@ class DataScanner(BaseScanner):
         # S3 is global — scan it exactly once regardless of which regions are targeted
         if not self._s3_scanned:
             self._s3_scanned = True
-            resources.extend(self._scan_s3())
-        resources.extend(self._scan_rds(region))
-        resources.extend(self._scan_dynamodb(region))
-        resources.extend(self._scan_elasticache(region))
+            resources.extend(self._safe_scan_call(
+                "s3", "list_buckets", region, lambda: self._scan_s3(),
+            ))
+        resources.extend(self._safe_scan_call(
+            "rds", "describe_db_instances", region, lambda: self._scan_rds(region),
+        ))
+        resources.extend(self._safe_scan_call(
+            "dynamodb", "list_tables", region, lambda: self._scan_dynamodb(region),
+        ))
+        resources.extend(self._safe_scan_call(
+            "elasticache", "describe_replication_groups", region,
+            lambda: self._scan_elasticache(region),
+        ))
         return resources
 
     # ───────────────────────────── S3 ────────────────────────────────────
 
     def _scan_s3(self) -> list[Resource]:
-        """
-        Enumerate all buckets in the account. For each:
-          - resolve its actual region
-          - read public access block, encryption, ACL, policy
-
-        Each per-bucket call can fail independently (permissions, region
-        weirdness). We log and skip — partial S3 inventory beats none.
-        """
         s3 = self.session.client("s3", region="us-east-1")
-        try:
-            response = s3.list_buckets()
-        except ClientError as e:
-            logger.warning("list_buckets failed: %s", e.response["Error"]["Code"])
-            raise
+        response = s3.list_buckets()
 
         resources = []
         for bucket in response["Buckets"]:
             bucket_name = bucket["Name"]
             try:
-                resource = self._inspect_bucket(bucket_name)
-                resources.append(resource)
+                resources.append(self._inspect_bucket(bucket_name))
             except ClientError as e:
                 # AccessDenied on individual buckets is common in shared accounts
-                logger.warning("Skipped bucket %s: %s", bucket_name, e.response["Error"]["Code"])
-                self.errors.append({
-                    "domain": self.domain,
-                    "resource": bucket_name,
-                    "error": str(e),
-                    "error_type": "S3InspectFailed",
-                })
+                err = e.response.get("Error", {}) or {}
+                code = err.get("Code", "Unknown")
+                logger.warning("Skipped bucket %s: %s", bucket_name, code)
+                self.errors.append(ScanError(
+                    domain=self.domain,
+                    account_id=self.session.account_id,
+                    region="global",
+                    service="s3",
+                    operation=f"inspect_bucket({bucket_name})",
+                    error_code=code,
+                    error_type="ClientError",
+                    message=err.get("Message", str(e)),
+                    request_id=(e.response.get("ResponseMetadata") or {}).get("RequestId"),
+                    category=categorize(code),
+                ).to_dict())
         return resources
 
     def _inspect_bucket(self, bucket_name: str) -> Resource:
-        # Bucket region — sometimes returns None for us-east-1, sometimes "EU"
         s3 = self.session.client("s3", region="us-east-1")
         loc_response = s3.get_bucket_location(Bucket=bucket_name)
         region = loc_response.get("LocationConstraint") or "us-east-1"
@@ -87,21 +91,15 @@ class DataScanner(BaseScanner):
 
         arn = f"arn:aws:s3:::{bucket_name}"
 
-        # Public access block (the modern safety net)
-        public_access_block = self._safe_call(
-            s3.get_public_access_block, Bucket=bucket_name
-        )
+        public_access_block = self._safe_call(s3.get_public_access_block, Bucket=bucket_name)
         pab = public_access_block.get("PublicAccessBlockConfiguration", {}) if public_access_block else {}
 
-        # Bucket policy (presence is more important than content for indexing)
         policy = self._safe_call(s3.get_bucket_policy, Bucket=bucket_name)
         bucket_policy = json.loads(policy["Policy"]) if policy and "Policy" in policy else None
 
-        # Encryption
         encryption = self._safe_call(s3.get_bucket_encryption, Bucket=bucket_name)
         is_encrypted = bool(encryption)
 
-        # Versioning
         versioning = self._safe_call(s3.get_bucket_versioning, Bucket=bucket_name)
         versioning_status = versioning.get("Status") if versioning else None
 
@@ -133,7 +131,8 @@ class DataScanner(BaseScanner):
         """
         Many S3 sub-API calls raise "NoSuch*" when the feature isn't configured
         (e.g., no bucket policy → NoSuchBucketPolicy). Treat those as "absent",
-        not as errors.
+        not as errors. Distinct from BaseScanner._safe_scan_call (which is for
+        scanner-level isolation).
         """
         try:
             return fn(**kwargs)
@@ -150,13 +149,15 @@ class DataScanner(BaseScanner):
         paginator = rds.get_paginator("describe_db_instances")
 
         resources = []
-        try:
-            for page in paginator.paginate():
-                for db in page["DBInstances"]:
+        for page in paginator.paginate():
+            for db in page["DBInstances"]:
+                try:
                     resources.append(self._normalize_rds(db, region))
-        except ClientError as e:
-            logger.warning("RDS scan failed in %s: %s", region, e.response["Error"]["Code"])
-            raise
+                except Exception as e:
+                    logger.warning(
+                        "[data] failed to normalize RDS %s in %s: %s",
+                        db.get("DBInstanceIdentifier", "?"), region, e,
+                    )
         return resources
 
     def _normalize_rds(self, db: dict, region: str) -> Resource:
@@ -200,23 +201,20 @@ class DataScanner(BaseScanner):
         ddb = self.session.client("dynamodb", region=region)
         paginator = ddb.get_paginator("list_tables")
         resources: list[Resource] = []
-        try:
-            for page in paginator.paginate():
-                for table_name in page["TableNames"]:
-                    try:
-                        resp = ddb.describe_table(TableName=table_name)
-                        resources.append(self._normalize_dynamodb(resp["Table"], region))
-                    except ClientError as e:
-                        logger.warning(
-                            "DescribeTable %s failed: %s",
-                            table_name,
-                            e.response["Error"]["Code"],
-                        )
-        except ClientError as e:
-            logger.warning(
-                "DynamoDB scan failed in %s: %s", region, e.response["Error"]["Code"]
-            )
-            raise
+        for page in paginator.paginate():
+            for table_name in page["TableNames"]:
+                try:
+                    resp = ddb.describe_table(TableName=table_name)
+                    resources.append(self._normalize_dynamodb(resp["Table"], region))
+                except ClientError as e:
+                    logger.warning(
+                        "DescribeTable %s failed: %s",
+                        table_name, e.response["Error"]["Code"],
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[data] failed to normalize DynamoDB %s: %s", table_name, e,
+                    )
         return resources
 
     def _normalize_dynamodb(self, table: dict, region: str) -> Resource:
@@ -225,7 +223,6 @@ class DataScanner(BaseScanner):
 
         sse = table.get("SSEDescription", {}) or {}
         kms_key_arn = sse.get("KMSMasterKeyArn")
-
         stream_spec = table.get("StreamSpecification", {}) or {}
 
         properties = {
@@ -236,7 +233,7 @@ class DataScanner(BaseScanner):
             ),
             "item_count": table.get("ItemCount", 0),
             "size_bytes": table.get("TableSizeBytes", 0),
-            "sse_type": sse.get("SSEType"),  # AES256 or KMS
+            "sse_type": sse.get("SSEType"),
             "sse_enabled": sse.get("Status") == "ENABLED",
             "kms_key_arn": kms_key_arn,
             "stream_enabled": bool(stream_spec.get("StreamEnabled")),
@@ -255,40 +252,60 @@ class DataScanner(BaseScanner):
     # ─────────────────────────── ElastiCache ─────────────────────────────
 
     def _scan_elasticache(self, region: str) -> list[Resource]:
-        ec = self.session.client("elasticache", region=region)
+        """
+        Two sub-calls: replication groups (Redis clusters) and cache clusters
+        (Memcached + standalone Redis). Each is isolated independently so one
+        failing doesn't lose the other.
+        """
         resources: list[Resource] = []
         seen_rg_ids: set[str] = set()
 
-        # Redis replication groups — the logical cluster entity (primary + replicas)
-        try:
-            paginator = ec.get_paginator("describe_replication_groups")
-            for page in paginator.paginate():
-                for rg in page["ReplicationGroups"]:
+        rg_resources = self._safe_scan_call(
+            "elasticache", "describe_replication_groups", region,
+            lambda: self._scan_elasticache_rgs(region, seen_rg_ids),
+        )
+        resources.extend(rg_resources)
+
+        cluster_resources = self._safe_scan_call(
+            "elasticache", "describe_cache_clusters", region,
+            lambda: self._scan_elasticache_clusters(region, seen_rg_ids),
+        )
+        resources.extend(cluster_resources)
+
+        return resources
+
+    def _scan_elasticache_rgs(self, region: str, seen_rg_ids: set[str]) -> list[Resource]:
+        ec = self.session.client("elasticache", region=region)
+        resources: list[Resource] = []
+        paginator = ec.get_paginator("describe_replication_groups")
+        for page in paginator.paginate():
+            for rg in page["ReplicationGroups"]:
+                try:
                     resources.append(self._normalize_replication_group(rg, region))
                     seen_rg_ids.add(rg["ReplicationGroupId"])
-        except ClientError as e:
-            logger.warning(
-                "ElastiCache DescribeReplicationGroups failed in %s: %s",
-                region,
-                e.response["Error"]["Code"],
-            )
+                except Exception as e:
+                    logger.warning(
+                        "[data] failed to normalize replication group %s: %s",
+                        rg.get("ReplicationGroupId", "?"), e,
+                    )
+        return resources
 
-        # Memcached clusters + single-node Redis not in a replication group
-        try:
-            paginator = ec.get_paginator("describe_cache_clusters")
-            for page in paginator.paginate():
-                for cluster in page["CacheClusters"]:
-                    rg_id = cluster.get("ReplicationGroupId")
-                    if rg_id and rg_id in seen_rg_ids:
-                        continue  # already covered above
+    def _scan_elasticache_clusters(self, region: str, seen_rg_ids: set[str]) -> list[Resource]:
+        ec = self.session.client("elasticache", region=region)
+        resources: list[Resource] = []
+        paginator = ec.get_paginator("describe_cache_clusters")
+        for page in paginator.paginate():
+            for cluster in page["CacheClusters"]:
+                rg_id = cluster.get("ReplicationGroupId")
+                if rg_id and rg_id in seen_rg_ids:
+                    continue  # already covered above
+                try:
                     resources.append(self._normalize_cache_cluster(cluster, region))
-        except ClientError as e:
-            logger.warning(
-                "ElastiCache DescribeCacheClusters failed in %s: %s",
-                region,
-                e.response["Error"]["Code"],
-            )
-
+                except Exception as e:
+                    logger.warning(
+                        "[data] failed to normalize cache cluster %s: %s",
+                        cluster.get("CacheClusterId", "?"), e,
+                    )
         return resources
 
     def _normalize_replication_group(self, rg: dict, region: str) -> Resource:
@@ -297,7 +314,7 @@ class DataScanner(BaseScanner):
             "ARN",
             f"arn:aws:elasticache:{region}:{self.session.account_id}:replicationgroup:{rg_id}",
         )
-        kms_key_arn = rg.get("KmsKeyId") or None  # may be key ARN or ID
+        kms_key_arn = rg.get("KmsKeyId") or None
 
         properties = {
             "cluster_id": rg_id,
@@ -313,7 +330,6 @@ class DataScanner(BaseScanner):
             "auth_token_enabled": rg.get("AuthTokenEnabled", False),
             "kms_key_arn": kms_key_arn,
             "member_count": len(rg.get("MemberClusters", [])),
-            # SG IDs are only on member cache clusters, not on the replication group object
             "security_group_ids": [],
         }
 
@@ -335,7 +351,6 @@ class DataScanner(BaseScanner):
         engine = cluster.get("Engine", "redis")
         sg_ids = [sg["SecurityGroupId"] for sg in cluster.get("SecurityGroups", [])]
         kms_key_arn = cluster.get("KmsKeyId") or None
-
         cluster_type = "memcached_cluster" if engine == "memcached" else "redis_standalone"
 
         properties = {
