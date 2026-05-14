@@ -206,12 +206,18 @@ class GraphSerializer:
                 except nx.NetworkXError:
                     continue
 
-                for path in paths[:3]:  # cap at 3 paths per (src, dst) pair
+                # Rank paths by risk-weighted score and take the top 3 per pair.
+                # The arbitrary [:3] truncation we used before dropped real
+                # attack chains when there were many low-quality candidates.
+                ranked = self._rank_paths(paths)
+
+                for path, _score, markers in ranked[:3]:
                     path_count += 1
                     node_chain = "  →  ".join(
                         self.graph.nodes[n].get("name", n) for n in path
                     )
-                    buf.write(f"\nPATH {path_count}: {node_chain}\n")
+                    marker_str = (" [" + " ".join(markers) + "]") if markers else ""
+                    buf.write(f"\nPATH {path_count}{marker_str}: {node_chain}\n")
                     for i in range(len(path) - 1):
                         u, v = path[i], path[i + 1]
                         for edge_attrs in self.graph[u][v].values():
@@ -220,6 +226,68 @@ class GraphSerializer:
         if path_count == 0:
             buf.write("  (no paths found between entry points and sinks)\n")
         buf.write("\n")
+
+    # ───────────────────────── Path ranking ───────────────────────────────
+
+    def _rank_paths(
+        self, paths: list[list[str]]
+    ) -> list[tuple[list[str], int, list[str]]]:
+        """
+        Score each path and return [(path, score, markers), ...] sorted by
+        score descending. `markers` is a small set of headline tags
+        (ADMIN, WILDCARD, CONFIRMED, WEAK) that surface what makes the
+        path notable without re-parsing the edge list.
+
+        Scoring rationale:
+            +5  per behavioral edge   ← CloudTrail-confirmed; not theoretical
+            +3  per admin edge        ← is_admin=True
+            +2  per wildcard edge     ← is_wildcard_resource=True
+            -2  per conditional edge  ← has_conditions=True (weaker exploit)
+            -1  per edge (length)     ← shorter paths preferred
+        """
+        scored: list[tuple[list[str], int, list[str]]] = []
+        for path in paths:
+            score = 0
+            wildcard_count = 0
+            admin_count = 0
+            behavioral_count = 0
+            conditional_count = 0
+
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i + 1]
+                score -= 1  # path length penalty per hop
+                for attrs in self.graph[u][v].values():
+                    if attrs.get("is_behavioral"):
+                        score += 5
+                        behavioral_count += 1
+                    if attrs.get("is_admin"):
+                        score += 3
+                        admin_count += 1
+                    if attrs.get("is_wildcard_resource"):
+                        score += 2
+                        wildcard_count += 1
+                    if attrs.get("has_conditions"):
+                        score -= 2
+                        conditional_count += 1
+
+            markers: list[str] = []
+            if behavioral_count:
+                markers.append("CONFIRMED")
+            if admin_count:
+                markers.append("ADMIN")
+            if wildcard_count:
+                markers.append("WILDCARD")
+            if conditional_count and not behavioral_count:
+                # CONFIRMED behavioral edges trump the WEAK marker —
+                # a path that actually happened isn't weakened by a Condition.
+                markers.append("WEAK")
+
+            scored.append((path, score, markers))
+
+        # Stable sort by score desc, then by length asc, then by string
+        # repr of path for determinism in tests.
+        scored.sort(key=lambda t: (-t[1], len(t[0]), str(t[0])))
+        return scored
 
     def _write_all_nodes(self, buf: StringIO) -> None:
         buf.write("=== ALL NODES ===\n")
