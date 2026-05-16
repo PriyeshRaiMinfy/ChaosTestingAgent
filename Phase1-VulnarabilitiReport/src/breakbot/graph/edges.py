@@ -27,7 +27,10 @@ class EdgeType(str, Enum):
     HAS_NODE_GROUP = "has_node_group"              # EKS cluster → managed node group
     HAS_FARGATE_PROFILE = "has_fargate_profile"    # EKS cluster → Fargate profile
     HAS_TARGET_GROUP = "has_target_group"          # ALB/NLB → target group
+    TARGET_GROUP_ROUTES_TO = "target_group_routes_to"  # Target Group → compute target
     ROUTES_TO = "routes_to"                        # EventBridge rule → target resource
+    DISTRIBUTES_TO = "distributes_to"              # CloudFront → origin (ALB/S3/custom)
+    INTEGRATES_WITH = "integrates_with"            # API Gateway → backend (Lambda/HTTP/VPC)
 
     # Security posture edges
     PROTECTED_BY_WAF = "protected_by_waf"          # CloudFront/API GW → WAF web ACL

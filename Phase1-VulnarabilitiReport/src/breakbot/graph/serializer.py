@@ -45,6 +45,11 @@ _INTERNET_FACING_TYPES = {
     ResourceType.ALB.value,
     ResourceType.EC2_INSTANCE.value,
     ResourceType.S3_BUCKET.value,
+    ResourceType.API_GATEWAY_REST_API.value,
+    ResourceType.API_GATEWAY_HTTP_API.value,
+    ResourceType.CLOUDFRONT_DISTRIBUTION.value,
+    ResourceType.EKS_CLUSTER.value,
+    ResourceType.ECS_SERVICE.value,
 }
 
 # Resource types that hold sensitive data (sinks for attack path analysis).
@@ -52,6 +57,10 @@ _SINK_TYPES = {
     ResourceType.RDS_INSTANCE.value,
     ResourceType.S3_BUCKET.value,
     ResourceType.IAM_ROLE.value,
+    ResourceType.SECRETS_MANAGER_SECRET.value,
+    ResourceType.DYNAMODB_TABLE.value,
+    ResourceType.KMS_KEY.value,
+    ResourceType.SSM_PARAMETER.value,
 }
 
 
@@ -131,12 +140,16 @@ class GraphSerializer:
 
     def _find_entry_points(self) -> set[str]:
         """
-        Internet-facing resources. Three sources:
+        Internet-facing resources:
           1. ALBs with internet-facing scheme
           2. EC2 instances with a public IP
           3. S3 buckets without a full public access block
-          4. Any resource with an INTERNET_EXPOSES edge pointing at its SG,
-             which in turn is attached to compute resources
+          4. API Gateway REST APIs (non-private)
+          5. API Gateway HTTP APIs (endpoint not disabled)
+          6. CloudFront distributions (enabled)
+          7. EKS clusters with public API endpoint
+          8. ECS services with public IP assignment
+          9. Any resource attached to internet-exposed security groups
         """
         entry_points: set[str] = set()
 
@@ -154,6 +167,26 @@ class GraphSerializer:
                 if resource and _s3_is_public(resource):
                     entry_points.add(node_id)
 
+            elif t == ResourceType.API_GATEWAY_REST_API.value:
+                if not attrs.get("is_private"):
+                    entry_points.add(node_id)
+
+            elif t == ResourceType.API_GATEWAY_HTTP_API.value:
+                if not attrs.get("disable_execute_api_endpoint"):
+                    entry_points.add(node_id)
+
+            elif t == ResourceType.CLOUDFRONT_DISTRIBUTION.value:
+                if attrs.get("enabled"):
+                    entry_points.add(node_id)
+
+            elif t == ResourceType.EKS_CLUSTER.value:
+                if attrs.get("endpoint_public_access"):
+                    entry_points.add(node_id)
+
+            elif t == ResourceType.ECS_SERVICE.value:
+                if attrs.get("assign_public_ip"):
+                    entry_points.add(node_id)
+
         # Resources attached to internet-exposed security groups
         for sg_arn in self.graph.successors(INTERNET_NODE_ID):
             for resource_arn in self.graph.predecessors(sg_arn):
@@ -165,7 +198,7 @@ class GraphSerializer:
 
     def _find_sinks(self) -> set[str]:
         """
-        High-value targets: databases, S3, and admin IAM roles.
+        High-value targets: data stores, secrets, crypto keys, and admin roles.
         """
         sinks: set[str] = set()
         for node_id, attrs in self.graph.nodes(data=True):
@@ -180,6 +213,18 @@ class GraphSerializer:
             elif t == ResourceType.IAM_ROLE.value:
                 if attrs.get("has_wildcard_resource_access"):
                     sinks.add(node_id)
+
+            elif t == ResourceType.SECRETS_MANAGER_SECRET.value:
+                sinks.add(node_id)
+
+            elif t == ResourceType.DYNAMODB_TABLE.value:
+                sinks.add(node_id)
+
+            elif t == ResourceType.KMS_KEY.value:
+                sinks.add(node_id)
+
+            elif t == ResourceType.SSM_PARAMETER.value:
+                sinks.add(node_id)
 
         return sinks
 
@@ -385,6 +430,43 @@ class GraphSerializer:
         elif t == ResourceType.ALB.value:
             _kv(parts, "internet_facing", attrs.get("is_internet_facing"))
             _kv(parts, "dns", attrs.get("dns_name"))
+
+        elif t == ResourceType.API_GATEWAY_REST_API.value:
+            _kv(parts, "private", attrs.get("is_private"))
+            _kv(parts, "has_authorizers", attrs.get("has_authorizers"))
+            _kv(parts, "has_waf", attrs.get("has_waf"))
+
+        elif t == ResourceType.API_GATEWAY_HTTP_API.value:
+            _kv(parts, "endpoint", attrs.get("endpoint"))
+            _kv(parts, "has_authorizer", attrs.get("has_authorizer"))
+            _kv(parts, "cors_allows_all", attrs.get("cors_allows_all_origins"))
+
+        elif t == ResourceType.CLOUDFRONT_DISTRIBUTION.value:
+            _kv(parts, "domain", attrs.get("domain_name"))
+            _kv(parts, "enabled", attrs.get("enabled"))
+            _kv(parts, "has_waf", attrs.get("has_waf"))
+            _kv(parts, "https_only", attrs.get("https_only"))
+
+        elif t == ResourceType.EKS_CLUSTER.value:
+            _kv(parts, "public_endpoint", attrs.get("endpoint_public_access"))
+            _kv(parts, "public_cidrs", attrs.get("public_access_cidrs"))
+            _kv(parts, "version", attrs.get("kubernetes_version"))
+
+        elif t == ResourceType.ECS_SERVICE.value:
+            _kv(parts, "public_ip", attrs.get("assign_public_ip"))
+            _kv(parts, "launch_type", attrs.get("launch_type"))
+
+        elif t == ResourceType.SECRETS_MANAGER_SECRET.value:
+            _kv(parts, "name", attrs.get("name"))
+
+        elif t == ResourceType.DYNAMODB_TABLE.value:
+            _kv(parts, "name", attrs.get("name"))
+
+        elif t == ResourceType.KMS_KEY.value:
+            _kv(parts, "name", attrs.get("name"))
+
+        elif t == ResourceType.SSM_PARAMETER.value:
+            _kv(parts, "name", attrs.get("name"))
 
         kv_str = " ".join(parts)
         label = f"[{t}]"
