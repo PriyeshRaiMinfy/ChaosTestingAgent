@@ -105,10 +105,7 @@ class ApiGatewayScanner(BaseScanner):
         api_id = api["id"]
         arn = f"arn:aws:execute-api:{region}:{self.session.account_id}:{api_id}"
 
-        endpoint_types = [
-            c["types"][0]
-            for c in api.get("endpointConfiguration", {}).get("types", []) or []
-        ] or (api.get("endpointConfiguration", {}).get("types") or [])
+        endpoint_types = api.get("endpointConfiguration", {}).get("types") or []
 
         stage_summaries = []
         stage_waf_arns: list[str] = []
