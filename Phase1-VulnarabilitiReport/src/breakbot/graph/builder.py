@@ -56,6 +56,9 @@ class GraphBuilder:
         self._eks_cluster_name_to_arn: dict[str, str] = {}  # cluster name → ARN
         self._kms_key_id_to_arn: dict[str, str] = {}        # key UUID → ARN
         self._waf_arn_index: set[str] = set()               # all known WAF web ACL ARNs
+        self._alb_dns_to_arn: dict[str, str] = {}           # ALB DNS name → ARN
+        self._s3_bucket_name_to_arn: dict[str, str] = {}    # bucket name → ARN
+        self._lambda_name_to_arn: dict[str, str] = {}       # function name → ARN
 
     @property
     def arn_index(self) -> dict[str, Resource]:
@@ -78,6 +81,9 @@ class GraphBuilder:
         self._add_vpc_membership_edges()
         self._add_encryption_edges()
         self._add_target_group_edges()
+        self._add_target_group_target_edges()
+        self._add_cloudfront_origin_edges()
+        self._add_api_gateway_integration_edges()
         self._add_waf_protection_edges()
         self._add_eventbridge_target_edges()
         self._add_step_functions_role_edges()
@@ -123,6 +129,21 @@ class GraphBuilder:
 
             elif resource.resource_type == ResourceType.WAF_WEB_ACL:
                 self._waf_arn_index.add(resource.arn)
+
+            elif resource.resource_type == ResourceType.ALB:
+                dns_name = resource.properties.get("dns_name")
+                if dns_name:
+                    self._alb_dns_to_arn[dns_name.lower()] = resource.arn
+
+            elif resource.resource_type == ResourceType.S3_BUCKET:
+                bucket_name = resource.name
+                if bucket_name:
+                    self._s3_bucket_name_to_arn[bucket_name] = resource.arn
+
+            elif resource.resource_type == ResourceType.LAMBDA_FUNCTION:
+                fn_name = resource.properties.get("function_name") or resource.name
+                if fn_name:
+                    self._lambda_name_to_arn[fn_name] = resource.arn
 
     # ─────────────────────────── Nodes ────────────────────────────────────
 
@@ -616,6 +637,133 @@ class GraphBuilder:
                         label=EdgeType.HAS_TARGET_GROUP.value,
                     )
 
+    # ─────────── Target Group → Compute Target Edges ────────────────────
+
+    def _add_target_group_target_edges(self) -> None:
+        """
+        Target Group → registered compute targets (target_group_routes_to).
+
+        Completes the network flow: ALB → TG → EC2/Lambda/IP.
+        Without this edge, BFS from an ALB entry point dead-ends at the TG.
+        """
+        for resource in self.result.resources:
+            if resource.resource_type != ResourceType.LOAD_BALANCER_TARGET_GROUP:
+                continue
+            for target in resource.properties.get("registered_targets", []):
+                target_id = target.get("id", "")
+                if not target_id:
+                    continue
+                # Instance ID → ARN resolution
+                resolved = self._resolve_target_id(target_id, resource.region)
+                if resolved:
+                    self.graph.add_edge(
+                        resource.arn,
+                        resolved,
+                        edge_type=EdgeType.TARGET_GROUP_ROUTES_TO,
+                        label=EdgeType.TARGET_GROUP_ROUTES_TO.value,
+                        port=target.get("port"),
+                    )
+
+    def _resolve_target_id(self, target_id: str, region: str) -> str | None:
+        """Resolve a TG target (instance ID, Lambda ARN, IP, or ALB ARN) to a graph node."""
+        if target_id.startswith("arn:"):
+            if target_id in self._arn_index:
+                return target_id
+            resolved = self._resolve_resource_arn(target_id)
+            if resolved in self._arn_index:
+                return resolved
+            # Lambda ARNs from target groups often include version/alias qualifiers
+            # e.g. arn:aws:lambda:us-east-1:123:function:MyFunc:1
+            #      arn:aws:lambda:us-east-1:123:function:MyFunc:$LATEST
+            #      arn:aws:lambda:us-east-1:123:function:MyFunc:live
+            stripped = _strip_lambda_qualifier(target_id)
+            if stripped != target_id and stripped in self._arn_index:
+                return stripped
+            return resolved
+        # Instance ID: i-xxxxx
+        for arn, res in self._arn_index.items():
+            if (res.resource_type == ResourceType.EC2_INSTANCE
+                    and res.properties.get("instance_id") == target_id):
+                return arn
+        return None
+
+    # ─────────── CloudFront → Origin Edges ────────────────────────────────
+
+    def _add_cloudfront_origin_edges(self) -> None:
+        """
+        CloudFront distribution → origin resource (distributes_to).
+
+        Resolves origin domain names back to scanned ALBs or S3 buckets.
+        Completes: INTERNET → CloudFront → ALB → TG → compute.
+        """
+        for resource in self.result.resources:
+            if resource.resource_type != ResourceType.CLOUDFRONT_DISTRIBUTION:
+                continue
+            for origin in resource.properties.get("origins", []):
+                domain = origin.get("domain_name", "").lower()
+                if not domain:
+                    continue
+                target_arn = self._resolve_origin_domain(domain)
+                if target_arn:
+                    self.graph.add_edge(
+                        resource.arn,
+                        target_arn,
+                        edge_type=EdgeType.DISTRIBUTES_TO,
+                        label=EdgeType.DISTRIBUTES_TO.value,
+                        origin_domain=domain,
+                    )
+
+    def _resolve_origin_domain(self, domain: str) -> str | None:
+        """Map a CF origin domain to a known ALB or S3 bucket ARN."""
+        # ALB DNS name match
+        if domain in self._alb_dns_to_arn:
+            return self._alb_dns_to_arn[domain]
+        # S3 bucket: <bucket>.s3.amazonaws.com or <bucket>.s3.<region>.amazonaws.com
+        if ".s3" in domain and "amazonaws.com" in domain:
+            bucket_name = domain.split(".s3")[0]
+            return self._s3_bucket_name_to_arn.get(bucket_name)
+        return None
+
+    # ─────────── API Gateway → Backend Integration Edges ──────────────────
+
+    def _add_api_gateway_integration_edges(self) -> None:
+        """
+        API Gateway → backend integration targets (integrates_with).
+
+        REST APIs and HTTP APIs store integration_targets (Lambda ARNs, HTTP
+        endpoints, VPC link targets) when the scanner fetches them.
+        """
+        for resource in self.result.resources:
+            if resource.resource_type not in (
+                ResourceType.API_GATEWAY_REST_API,
+                ResourceType.API_GATEWAY_HTTP_API,
+            ):
+                continue
+            for integration in resource.properties.get("integration_targets", []):
+                target_arn = integration.get("target_arn", "")
+                if not target_arn:
+                    continue
+                resolved = self._resolve_resource_arn(target_arn)
+                if resolved in self._arn_index:
+                    self.graph.add_edge(
+                        resource.arn,
+                        resolved,
+                        edge_type=EdgeType.INTEGRATES_WITH,
+                        label=EdgeType.INTEGRATES_WITH.value,
+                        integration_type=integration.get("type", "unknown"),
+                        method=integration.get("method"),
+                    )
+                elif target_arn.startswith("arn:"):
+                    self._ensure_node(target_arn, "unknown")
+                    self.graph.add_edge(
+                        resource.arn,
+                        target_arn,
+                        edge_type=EdgeType.INTEGRATES_WITH,
+                        label=EdgeType.INTEGRATES_WITH.value,
+                        integration_type=integration.get("type", "unknown"),
+                        method=integration.get("method"),
+                    )
+
     # ─────────────── WAF Protection Edges ─────────────────────────────────
 
     def _add_waf_protection_edges(self) -> None:
@@ -780,6 +928,23 @@ def _as_list(value: Any) -> list:
     if value is None:
         return []
     return [value]
+
+
+def _strip_lambda_qualifier(arn: str) -> str:
+    """
+    Strip version/alias qualifier from a Lambda function ARN.
+    arn:aws:lambda:us-east-1:123:function:MyFunc:1       → ...function:MyFunc
+    arn:aws:lambda:us-east-1:123:function:MyFunc:$LATEST → ...function:MyFunc
+    arn:aws:lambda:us-east-1:123:function:MyFunc:live    → ...function:MyFunc
+    """
+    if ":function:" not in arn:
+        return arn
+    parts = arn.split(":")
+    # Unqualified Lambda ARN has 7 colon-separated parts
+    # Qualified has 8 (the qualifier is the 8th)
+    if len(parts) == 8:
+        return ":".join(parts[:7])
+    return arn
 
 
 def _is_scalar(value: Any) -> bool:

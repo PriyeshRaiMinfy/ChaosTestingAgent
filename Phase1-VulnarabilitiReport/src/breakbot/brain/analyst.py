@@ -23,7 +23,7 @@ from breakbot.brain.report import AnalysisReport, AttackPath
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "claude-opus-4-7"
+_MODEL = "claude-sonnet-4-6-20250514"
 _TOOL_NAME = "record_security_analysis"
 
 _SYSTEM_PROMPT = """\
@@ -166,7 +166,6 @@ class SecurityAnalyst:
         with self._client.messages.stream(
             model=_MODEL,
             max_tokens=8192,
-            thinking={"type": "adaptive"},
             tools=[_ANALYSIS_TOOL],
             tool_choice={"type": "tool", "name": _TOOL_NAME},
             system=[

@@ -199,7 +199,9 @@ class NetworkingScanner(BaseScanner):
         for page in paginator.paginate():
             for tg in page.get("TargetGroups", []):
                 try:
-                    resources.append(self._normalize_target_group(tg, region))
+                    resources.append(
+                        self._normalize_target_group(tg, region, elbv2)
+                    )
                 except Exception as e:
                     logger.warning(
                         "[networking] failed to normalize target group %s: %s",
@@ -207,9 +209,13 @@ class NetworkingScanner(BaseScanner):
                     )
         return resources
 
-    def _normalize_target_group(self, tg: dict, region: str) -> Resource:
+    def _normalize_target_group(
+        self, tg: dict, region: str, elbv2
+    ) -> Resource:
         arn = tg["TargetGroupArn"]
         name = tg["TargetGroupName"]
+
+        registered_targets = self._fetch_registered_targets(elbv2, arn)
 
         properties = {
             "target_group_name": name,
@@ -221,6 +227,7 @@ class NetworkingScanner(BaseScanner):
             "health_check_protocol": tg.get("HealthCheckProtocol"),
             "health_check_port": tg.get("HealthCheckPort"),
             "lb_arns": tg.get("LoadBalancerArns", []),
+            "registered_targets": registered_targets,
         }
 
         return Resource(
@@ -231,6 +238,21 @@ class NetworkingScanner(BaseScanner):
             account_id=self.session.account_id,
             properties=properties,
         )
+
+    def _fetch_registered_targets(self, elbv2, tg_arn: str) -> list[dict]:
+        """Fetch compute targets registered to a target group."""
+        try:
+            resp = elbv2.describe_target_health(TargetGroupArn=tg_arn)
+            return [
+                {"id": t["Target"]["Id"], "port": t["Target"].get("Port")}
+                for t in resp.get("TargetHealthDescriptions", [])
+            ]
+        except Exception as e:
+            logger.debug(
+                "[networking] describe_target_health failed for %s: %s",
+                tg_arn, e,
+            )
+            return []
 
     # ─────────────────────── NAT Gateways ─────────────────────────────────
 
