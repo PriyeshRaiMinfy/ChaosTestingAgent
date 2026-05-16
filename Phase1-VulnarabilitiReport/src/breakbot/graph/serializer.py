@@ -198,7 +198,9 @@ class GraphSerializer:
 
     def _find_sinks(self) -> set[str]:
         """
-        High-value targets: data stores, secrets, crypto keys, and admin roles.
+        High-value targets: data stores, secrets, crypto keys, and custom
+        roles with dangerous access. Excludes AWS service-linked and
+        AWS-managed roles which inflate sink count without real attack value.
         """
         sinks: set[str] = set()
         for node_id, attrs in self.graph.nodes(data=True):
@@ -212,7 +214,8 @@ class GraphSerializer:
 
             elif t == ResourceType.IAM_ROLE.value:
                 if attrs.get("has_wildcard_resource_access"):
-                    sinks.add(node_id)
+                    if not _is_service_linked_or_aws_managed(node_id, attrs):
+                        sinks.add(node_id)
 
             elif t == ResourceType.SECRETS_MANAGER_SECRET.value:
                 sinks.add(node_id)
@@ -252,6 +255,14 @@ class GraphSerializer:
         entry_points: set[str],
         sinks: set[str],
     ) -> None:
+        # Self-exposed resources: entry point AND sink (e.g., public S3 bucket)
+        self_exposed = sorted(entry_points & sinks)
+        if self_exposed:
+            buf.write("=== SELF-EXPOSED RESOURCES (entry point = sink) ===\n")
+            for node_id in self_exposed:
+                buf.write(f"  {self._node_line(node_id)}\n")
+            buf.write("\n")
+
         buf.write(f"=== ATTACK SURFACE PATHS (entry → sink, ≤{self.max_hops} hops) ===\n")
 
         path_count = 0
@@ -535,3 +546,40 @@ def _s3_is_public(resource: Resource) -> bool:
         pab.get("block_public_policy"),
         pab.get("restrict_public_buckets"),
     ])
+
+
+_SERVICE_LINKED_PATTERNS = (
+    "/aws-service-role/",
+    "AWSServiceRole",
+)
+
+_AWS_MANAGED_ROLE_PREFIXES = (
+    "AWS-QuickSetup-",
+    "AWS-SSM-",
+    "AWSBackup",
+    "AWSCodePipeline",
+    "AWSGlue",
+    "AWSReservedSSO_",
+    "AmazonBedrock",
+    "AmazonEKSAuto",
+    "AmazonEKSPodIdentity",
+    "AmazonEKS_",
+    "AmazonQ",
+    "AmazonSSM",
+    "APIGatewayCloudWatchLogsRole",
+)
+
+
+def _is_service_linked_or_aws_managed(node_id: str, attrs: dict) -> bool:
+    """
+    Returns True for AWS service-linked roles and AWS-managed service roles
+    that are not realistic attack targets (attacker can't assume them directly).
+    """
+    role_name = attrs.get("role_name", "") or ""
+    for pattern in _SERVICE_LINKED_PATTERNS:
+        if pattern in node_id or pattern in role_name:
+            return True
+    for prefix in _AWS_MANAGED_ROLE_PREFIXES:
+        if role_name.startswith(prefix):
+            return True
+    return False
