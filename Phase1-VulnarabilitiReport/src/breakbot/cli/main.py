@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -140,21 +141,31 @@ def _scan_single_account(
     selected_domains: list[str],
     summary_rows: list,
 ) -> tuple[list[Resource], list[dict]]:
-    """Run the selected scanners against one account's session."""
+    """Run the selected scanners against one account's session (parallel)."""
     account_resources: list[Resource] = []
     account_errors: list[dict] = []
 
-    for name in selected_domains:
+    def _run_domain(name: str) -> tuple[str, list[Resource], list[dict]]:
         scanner_cls = SCANNER_REGISTRY[name]
         scanner = scanner_cls(session)
-        console.print(f"  [bold]▶ {name}[/bold]")
         resources = scanner.scan(regions=regions)
-        # Tag each error with the account so the merged error log stays traceable
         for err in scanner.errors:
             err.setdefault("account_id", session.account_id)
-        account_resources.extend(resources)
-        account_errors.extend(scanner.errors)
-        summary_rows.append((session.account_id, name, len(resources), len(scanner.errors)))
+        return name, resources, scanner.errors
+
+    max_workers = min(len(selected_domains), 10)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_run_domain, name): name
+            for name in selected_domains
+        }
+        console.print(f"  [dim]Scanning {len(selected_domains)} domains in parallel (workers={max_workers})[/dim]")
+        for future in as_completed(futures):
+            name, resources, errors = future.result()
+            console.print(f"  [bold]✔ {name}[/bold] — {len(resources)} resources")
+            account_resources.extend(resources)
+            account_errors.extend(errors)
+            summary_rows.append((session.account_id, name, len(resources), len(errors)))
 
     return account_resources, account_errors
 
