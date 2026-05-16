@@ -140,16 +140,15 @@ class GraphSerializer:
 
     def _find_entry_points(self) -> set[str]:
         """
-        Internet-facing resources:
-          1. ALBs with internet-facing scheme
-          2. EC2 instances with a public IP
-          3. S3 buckets without a full public access block
-          4. API Gateway REST APIs (non-private)
-          5. API Gateway HTTP APIs (endpoint not disabled)
-          6. CloudFront distributions (enabled)
-          7. EKS clusters with public API endpoint
-          8. ECS services with public IP assignment
-          9. Any resource attached to internet-exposed security groups
+        Internet-facing resources with validated network reachability.
+
+        For compute resources (EC2, ECS), full validation requires:
+          - public IP / public flag
+          - subnet has route to IGW (public subnet)
+          - NACL does not block all inbound
+
+        If subnet/route data is unavailable, falls back to the flag alone
+        (graceful degradation for scans without network topology data).
         """
         entry_points: set[str] = set()
 
@@ -160,7 +159,8 @@ class GraphSerializer:
                 entry_points.add(node_id)
 
             elif t == ResourceType.EC2_INSTANCE.value and attrs.get("is_public"):
-                entry_points.add(node_id)
+                if self._subnet_confirms_public(node_id):
+                    entry_points.add(node_id)
 
             elif t == ResourceType.S3_BUCKET.value:
                 resource = self.arn_index.get(node_id)
@@ -185,7 +185,8 @@ class GraphSerializer:
 
             elif t == ResourceType.ECS_SERVICE.value:
                 if attrs.get("assign_public_ip"):
-                    entry_points.add(node_id)
+                    if self._subnet_confirms_public(node_id):
+                        entry_points.add(node_id)
 
         # Resources attached to internet-exposed security groups
         for sg_arn in self.graph.successors(INTERNET_NODE_ID):
@@ -195,6 +196,52 @@ class GraphSerializer:
                     entry_points.add(resource_arn)
 
         return entry_points
+
+    def _subnet_confirms_public(self, node_id: str) -> bool:
+        """
+        Check if a resource's subnet has a route to an IGW (public subnet)
+        and is not blocked by a NACL deny-all rule.
+
+        Returns True if:
+          - subnet data is not available (graceful fallback — assume exposed)
+          - subnet route table has 0.0.0.0/0 → IGW AND no NACL blocks all inbound
+
+        Returns False only when we can confirm the resource is in a
+        private subnet (route exists but goes to NAT, not IGW).
+        """
+        from breakbot.graph.edges import EdgeType
+
+        # Find subnets this resource connects to
+        subnet_arns: list[str] = []
+        for _, target, edge_attrs in self.graph.out_edges(node_id, data=True):
+            if edge_attrs.get("edge_type") == EdgeType.IN_SUBNET:
+                subnet_arns.append(target)
+
+        if not subnet_arns:
+            return True  # no subnet data — fall back to flag-based detection
+
+        # Check if ANY subnet has IGW route
+        for subnet_arn in subnet_arns:
+            has_igw = False
+            nacl_blocks = False
+
+            # subnet → route_table
+            for _, rt_target, edge_attrs in self.graph.out_edges(subnet_arn, data=True):
+                if edge_attrs.get("edge_type") == EdgeType.SUBNET_ROUTES_VIA:
+                    rt_attrs = self.graph.nodes.get(rt_target, {})
+                    if rt_attrs.get("has_igw_route"):
+                        has_igw = True
+
+            # Check NACL → subnet (incoming edge to subnet)
+            for nacl_src, _, edge_attrs in self.graph.in_edges(subnet_arn, data=True):
+                if edge_attrs.get("edge_type") == EdgeType.NACL_PROTECTS:
+                    if edge_attrs.get("blocks_all_inbound"):
+                        nacl_blocks = True
+
+            if has_igw and not nacl_blocks:
+                return True
+
+        return False
 
     def _find_sinks(self) -> set[str]:
         """
@@ -411,6 +458,7 @@ class GraphSerializer:
             _kv(parts, "public_ip", attrs.get("public_ip"))
             _kv(parts, "imds_v1", attrs.get("imds_v1_allowed"))
             _kv(parts, "profile", attrs.get("iam_instance_profile_arn"))
+            _kv(parts, "public_subnet", self._subnet_confirms_public(node_id) if attrs.get("is_public") else None)
 
         elif t == ResourceType.LAMBDA_FUNCTION.value:
             _kv(parts, "runtime", attrs.get("runtime"))
