@@ -24,6 +24,14 @@ class EdgeType(str, Enum):
 
     # Structural / membership edges
     IN_VPC = "in_vpc"
+    IN_SUBNET = "in_subnet"                        # resource → subnet
+    SUBNET_ROUTES_VIA = "subnet_routes_via"        # subnet → route table
+    ROUTE_TO_IGW = "route_to_igw"                  # route table → IGW (public route)
+    ROUTE_TO_NAT = "route_to_nat"                  # route table → NAT GW (outbound only)
+    ROUTE_TO_TGW = "route_to_tgw"                  # route table → Transit GW (lateral)
+    ROUTE_TO_PEERING = "route_to_peering"          # route table → VPC peering (lateral)
+    NACL_PROTECTS = "nacl_protects"                # NACL → subnet
+    PEERS_WITH = "peers_with"                      # VPC → VPC (via peering)
     HAS_NODE_GROUP = "has_node_group"              # EKS cluster → managed node group
     HAS_FARGATE_PROFILE = "has_fargate_profile"    # EKS cluster → Fargate profile
     HAS_TARGET_GROUP = "has_target_group"          # ALB/NLB → target group

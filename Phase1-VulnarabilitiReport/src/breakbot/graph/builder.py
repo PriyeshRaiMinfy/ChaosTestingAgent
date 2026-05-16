@@ -59,6 +59,8 @@ class GraphBuilder:
         self._alb_dns_to_arn: dict[str, str] = {}           # ALB DNS name → ARN
         self._s3_bucket_name_to_arn: dict[str, str] = {}    # bucket name → ARN
         self._lambda_name_to_arn: dict[str, str] = {}       # function name → ARN
+        self._subnet_id_to_arn: dict[str, str] = {}         # subnet-xxxxxx → ARN
+        self._rt_id_to_arn: dict[str, str] = {}             # rtb-xxxxxx → ARN
 
     @property
     def arn_index(self) -> dict[str, Resource]:
@@ -79,6 +81,7 @@ class GraphBuilder:
         self._add_iam_policy_access_edges()
         self._add_resource_policy_edges()
         self._add_vpc_membership_edges()
+        self._add_subnet_topology_edges()
         self._add_encryption_edges()
         self._add_target_group_edges()
         self._add_target_group_target_edges()
@@ -144,6 +147,16 @@ class GraphBuilder:
                 fn_name = resource.properties.get("function_name") or resource.name
                 if fn_name:
                     self._lambda_name_to_arn[fn_name] = resource.arn
+
+            elif resource.resource_type == ResourceType.SUBNET:
+                subnet_id = resource.properties.get("subnet_id")
+                if subnet_id:
+                    self._subnet_id_to_arn[subnet_id] = resource.arn
+
+            elif resource.resource_type == ResourceType.ROUTE_TABLE:
+                rt_id = resource.properties.get("route_table_id")
+                if rt_id:
+                    self._rt_id_to_arn[rt_id] = resource.arn
 
     # ─────────────────────────── Nodes ────────────────────────────────────
 
@@ -518,6 +531,9 @@ class GraphBuilder:
             ResourceType.EKS_CLUSTER,
             ResourceType.NAT_GATEWAY,
             ResourceType.INTERNET_GATEWAY,
+            ResourceType.SUBNET,
+            ResourceType.ROUTE_TABLE,
+            ResourceType.NETWORK_ACL,
         }
         for resource in self.result.resources:
             if resource.resource_type not in _VPC_TYPES:
@@ -532,6 +548,135 @@ class GraphBuilder:
                     vpc_arn,
                     edge_type=EdgeType.IN_VPC,
                     label=EdgeType.IN_VPC.value,
+                )
+
+    # ──────────────── Subnet Topology Edges ──────────────────────────────
+
+    def _add_subnet_topology_edges(self) -> None:
+        """
+        Build subnet/route-table/NACL/peering topology:
+          - resource → subnet (IN_SUBNET)
+          - subnet → route_table (SUBNET_ROUTES_VIA)
+          - route_table → IGW/NAT/TGW/peering (ROUTE_TO_*)
+          - NACL → subnet (NACL_PROTECTS)
+          - VPC → VPC via peering (PEERS_WITH)
+        """
+        # Build a map: subnet_id → route_table_arn (from route table associations)
+        subnet_to_rt: dict[str, str] = {}
+        main_rt_per_vpc: dict[str, str] = {}
+
+        for resource in self.result.resources:
+            if resource.resource_type != ResourceType.ROUTE_TABLE:
+                continue
+            rt_arn = resource.arn
+            props = resource.properties
+            if props.get("is_main"):
+                vpc_id = props.get("vpc_id")
+                if vpc_id:
+                    main_rt_per_vpc[vpc_id] = rt_arn
+            for subnet_id in props.get("associated_subnet_ids", []):
+                subnet_to_rt[subnet_id] = rt_arn
+
+        # resource → subnet edges (EC2, Lambda, RDS, EKS nodegroups, NAT GW)
+        for resource in self.result.resources:
+            subnet_ids = resource.properties.get("subnet_ids") or []
+            subnet_id = resource.properties.get("subnet_id")
+            if subnet_id and subnet_id not in subnet_ids:
+                subnet_ids.append(subnet_id)
+            for sid in subnet_ids:
+                subnet_arn = self._subnet_id_to_arn.get(sid)
+                if subnet_arn:
+                    self.graph.add_edge(
+                        resource.arn,
+                        subnet_arn,
+                        edge_type=EdgeType.IN_SUBNET,
+                        label=EdgeType.IN_SUBNET.value,
+                    )
+
+        # subnet → route_table edges
+        for resource in self.result.resources:
+            if resource.resource_type != ResourceType.SUBNET:
+                continue
+            subnet_id = resource.properties.get("subnet_id")
+            vpc_id = resource.properties.get("vpc_id")
+            rt_arn = subnet_to_rt.get(subnet_id)
+            if not rt_arn and vpc_id:
+                rt_arn = main_rt_per_vpc.get(vpc_id)
+            if rt_arn:
+                self.graph.add_edge(
+                    resource.arn,
+                    rt_arn,
+                    edge_type=EdgeType.SUBNET_ROUTES_VIA,
+                    label=EdgeType.SUBNET_ROUTES_VIA.value,
+                )
+
+        # route_table → gateway edges
+        for resource in self.result.resources:
+            if resource.resource_type != ResourceType.ROUTE_TABLE:
+                continue
+            props = resource.properties
+            for route in props.get("routes", []):
+                target = route.get("target", "")
+                target_type = route.get("target_type", "")
+                dest = route.get("destination", "")
+                if dest not in ("0.0.0.0/0", "::/0"):
+                    continue
+
+                if target_type == "igw":
+                    igw_arn = f"arn:aws:ec2:{resource.region}:{resource.account_id}:internet-gateway/{target}"
+                    self._ensure_node(igw_arn, ResourceType.INTERNET_GATEWAY.value)
+                    self.graph.add_edge(
+                        resource.arn,
+                        igw_arn,
+                        edge_type=EdgeType.ROUTE_TO_IGW,
+                        label=EdgeType.ROUTE_TO_IGW.value,
+                    )
+                elif target_type == "nat":
+                    nat_arn = f"arn:aws:ec2:{resource.region}:{resource.account_id}:natgateway/{target}"
+                    self._ensure_node(nat_arn, ResourceType.NAT_GATEWAY.value)
+                    self.graph.add_edge(
+                        resource.arn,
+                        nat_arn,
+                        edge_type=EdgeType.ROUTE_TO_NAT,
+                        label=EdgeType.ROUTE_TO_NAT.value,
+                    )
+
+        # NACL → subnet edges
+        for resource in self.result.resources:
+            if resource.resource_type != ResourceType.NETWORK_ACL:
+                continue
+            for subnet_id in resource.properties.get("associated_subnet_ids", []):
+                subnet_arn = self._subnet_id_to_arn.get(subnet_id)
+                if subnet_arn:
+                    self.graph.add_edge(
+                        resource.arn,
+                        subnet_arn,
+                        edge_type=EdgeType.NACL_PROTECTS,
+                        label=EdgeType.NACL_PROTECTS.value,
+                        blocks_all_inbound=resource.properties.get("blocks_all_inbound", False),
+                    )
+
+        # VPC peering edges
+        for resource in self.result.resources:
+            if resource.resource_type != ResourceType.VPC_PEERING_CONNECTION:
+                continue
+            props = resource.properties
+            req_vpc = self._vpc_id_to_arn.get(props.get("requester_vpc_id", ""))
+            acc_vpc = self._vpc_id_to_arn.get(props.get("accepter_vpc_id", ""))
+            if req_vpc and acc_vpc:
+                self.graph.add_edge(
+                    req_vpc,
+                    acc_vpc,
+                    edge_type=EdgeType.PEERS_WITH,
+                    label=EdgeType.PEERS_WITH.value,
+                    is_cross_account=props.get("is_cross_account", False),
+                )
+                self.graph.add_edge(
+                    acc_vpc,
+                    req_vpc,
+                    edge_type=EdgeType.PEERS_WITH,
+                    label=EdgeType.PEERS_WITH.value,
+                    is_cross_account=props.get("is_cross_account", False),
                 )
 
     # ──────────────────── EKS Role Edges ──────────────────────────────────
