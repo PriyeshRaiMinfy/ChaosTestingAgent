@@ -640,6 +640,24 @@ class GraphBuilder:
                         edge_type=EdgeType.ROUTE_TO_NAT,
                         label=EdgeType.ROUTE_TO_NAT.value,
                     )
+                elif target_type == "tgw":
+                    tgw_node = f"tgw:{target}"
+                    self._ensure_node(tgw_node, "transit_gateway")
+                    self.graph.add_edge(
+                        resource.arn,
+                        tgw_node,
+                        edge_type=EdgeType.ROUTE_TO_TGW,
+                        label=EdgeType.ROUTE_TO_TGW.value,
+                    )
+                elif target_type == "pcx":
+                    pcx_arn = f"arn:aws:ec2:{resource.region}:{resource.account_id}:vpc-peering-connection/{target}"
+                    self._ensure_node(pcx_arn, ResourceType.VPC_PEERING_CONNECTION.value)
+                    self.graph.add_edge(
+                        resource.arn,
+                        pcx_arn,
+                        edge_type=EdgeType.ROUTE_TO_PEERING,
+                        label=EdgeType.ROUTE_TO_PEERING.value,
+                    )
 
         # NACL → subnet edges
         for resource in self.result.resources:
