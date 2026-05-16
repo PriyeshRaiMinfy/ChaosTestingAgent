@@ -614,6 +614,7 @@ _AWS_MANAGED_ROLE_PREFIXES = (
     "AmazonEKS_",
     "AmazonQ",
     "AmazonSSM",
+    "AmazonSageMaker",
     "APIGatewayCloudWatchLogsRole",
 )
 
