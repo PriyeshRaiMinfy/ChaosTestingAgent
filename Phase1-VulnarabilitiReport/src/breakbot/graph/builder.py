@@ -157,7 +157,7 @@ class GraphBuilder:
             scalar_props = {
                 k: v
                 for k, v in resource.properties.items()
-                if _is_scalar(v)
+                if _is_scalar(v) and k not in ("name", "type", "region", "account_id")
             }
             self.graph.add_node(
                 resource.arn,
