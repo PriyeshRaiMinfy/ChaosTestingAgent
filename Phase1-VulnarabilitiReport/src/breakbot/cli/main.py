@@ -728,12 +728,19 @@ def report(
              "ENTRY POINTS / SINKS / PATHS are always preserved in full; "
              "ALL NODES / ALL EDGES sections truncate first.",
     ),
+    region: str = typer.Option("ap-south-1", "--region", "-r", help="AWS region for Bedrock"),
+    bedrock: bool = typer.Option(
+        True, "--bedrock/--no-bedrock",
+        help="Use AWS Bedrock for Claude API (default). "
+             "Use --no-bedrock + ANTHROPIC_API_KEY for direct Anthropic API.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
     """Generate an LLM-powered attack-path report from a completed scan.
 
     Requires the 'anthropic' package: pip install 'breakbot[llm]'
-    Set ANTHROPIC_API_KEY in your environment before running.
+    Default: uses AWS Bedrock (same credentials as scan).
+    Alternative: set ANTHROPIC_API_KEY and use --no-bedrock.
     """
     _configure_logging(verbose)
 
@@ -795,8 +802,9 @@ def report(
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1) from e
 
-    console.print(f"\n[bold]Calling Claude (claude-opus-4-7) for threat analysis...[/bold]")
-    analyst = SecurityAnalyst()
+    backend = "AWS Bedrock" if bedrock else "Anthropic API"
+    console.print(f"\n[bold]Calling Claude via {backend} for threat analysis...[/bold]")
+    analyst = SecurityAnalyst(use_bedrock=bedrock, region=region)
     analysis = analyst.analyze(attack_surface, posture_findings)
 
     # Determine output path
