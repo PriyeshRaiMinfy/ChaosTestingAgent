@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -140,21 +141,31 @@ def _scan_single_account(
     selected_domains: list[str],
     summary_rows: list,
 ) -> tuple[list[Resource], list[dict]]:
-    """Run the selected scanners against one account's session."""
+    """Run the selected scanners against one account's session (parallel)."""
     account_resources: list[Resource] = []
     account_errors: list[dict] = []
 
-    for name in selected_domains:
+    def _run_domain(name: str) -> tuple[str, list[Resource], list[dict]]:
         scanner_cls = SCANNER_REGISTRY[name]
         scanner = scanner_cls(session)
-        console.print(f"  [bold]▶ {name}[/bold]")
         resources = scanner.scan(regions=regions)
-        # Tag each error with the account so the merged error log stays traceable
         for err in scanner.errors:
             err.setdefault("account_id", session.account_id)
-        account_resources.extend(resources)
-        account_errors.extend(scanner.errors)
-        summary_rows.append((session.account_id, name, len(resources), len(scanner.errors)))
+        return name, resources, scanner.errors
+
+    max_workers = min(len(selected_domains), 10)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_run_domain, name): name
+            for name in selected_domains
+        }
+        console.print(f"  [dim]Scanning {len(selected_domains)} domains in parallel (workers={max_workers})[/dim]")
+        for future in as_completed(futures):
+            name, resources, errors = future.result()
+            console.print(f"  [bold]✔ {name}[/bold] — {len(resources)} resources")
+            account_resources.extend(resources)
+            account_errors.extend(errors)
+            summary_rows.append((session.account_id, name, len(resources), len(errors)))
 
     return account_resources, account_errors
 
@@ -234,6 +245,21 @@ def scan(
         raise typer.Exit(1)
 
     # Decide which accounts and regions to walk
+    # Auto-detect org if --org not explicitly passed
+    if not org:
+        from breakbot.org.discovery import EnvironmentDiscovery
+        _disc = EnvironmentDiscovery(master, member_role_name=member_role)
+        _det = _disc._detect_org()
+        if _det[0] and len(_det[1]) > 1:
+            console.print(
+                f"\n[bold yellow]Organization detected:[/bold yellow] "
+                f"{len(_det[1])} active accounts found."
+            )
+            console.print(
+                "[dim]Scanning current account only. "
+                "Use --org to scan all accounts, or run `breakbot discover` for details.[/dim]"
+            )
+
     if org:
         org_scanner = OrganizationScanner(master)
         accounts = org_scanner.list_accounts()
@@ -243,7 +269,7 @@ def scan(
             missing = requested - {a["Id"] for a in accounts}
             if missing:
                 console.print(
-                    f"[yellow]⚠ Requested account IDs not found in Org or not ACTIVE: "
+                    f"[yellow]Warning: Requested account IDs not found in Org or not ACTIVE: "
                     f"{sorted(missing)}[/yellow]"
                 )
         console.print(f"Organization mode: [yellow]{len(accounts)}[/yellow] account(s) to scan")
@@ -358,14 +384,56 @@ def scan(
     # CloudTrail behavioral overlay (optional — only when --trail is set)
     if trail:
         console.print("\n[bold]Fetching CloudTrail behavioral events...[/bold]")
+        from breakbot.scanner.cloudtrail import OrgTrailS3Reader
         trail_scanner = CloudTrailScanner()
         days = min(trail_days, 90)
-        # Use the master session for trail (org mode: trail is in management/audit account)
-        trail_events = trail_scanner.scan(master, regions_seen, lookback_days=days)
+        trail_events: list[TrailEvent] = []
+
+        if org and factory:
+            # Org mode: prefer S3 org trail if accessible, else per-account LookupEvents
+            from breakbot.org.discovery import EnvironmentDiscovery
+            disc = EnvironmentDiscovery(master, member_role_name=member_role)
+            org_trail = disc._find_org_trail()
+
+            if org_trail and org_trail.is_accessible:
+                console.print(
+                    f"  [green]Reading org trail from S3:[/green] {org_trail.s3_bucket_name}"
+                )
+                reader = OrgTrailS3Reader(
+                    session=master,
+                    bucket=org_trail.s3_bucket_name,
+                    prefix=org_trail.s3_key_prefix,
+                )
+                trail_events = reader.read(
+                    lookback_days=days,
+                    account_ids=accounts_actually_scanned,
+                    regions=list(regions_seen),
+                )
+            else:
+                # Fallback: per-account LookupEvents
+                if org_trail:
+                    console.print(
+                        f"  [yellow]Org trail S3 not accessible ({org_trail.access_error}). "
+                        f"Falling back to per-account LookupEvents.[/yellow]"
+                    )
+                for acct_id in accounts_actually_scanned:
+                    if acct_id == master.account_id:
+                        sess = master
+                    else:
+                        sess = factory.try_session_for(acct_id, region=region)
+                        if sess is None:
+                            continue
+                    console.print(f"  [dim]CloudTrail: {acct_id}...[/dim]")
+                    acct_events = trail_scanner.scan(sess, list(regions_seen), lookback_days=days)
+                    trail_events.extend(acct_events)
+        else:
+            # Single account mode
+            trail_events = trail_scanner.scan(master, list(regions_seen), lookback_days=days)
+
         trail_dicts = [e.to_dict() for e in trail_events]
         (scan_dir / "trail.json").write_text(json.dumps(trail_dicts, indent=2))
         console.print(
-            f"[green]✔[/green] {len(trail_events)} behavioral event(s) written to "
+            f"[green]OK[/green] {len(trail_events)} behavioral event(s) written to "
             f"[bold]{scan_dir / 'trail.json'}[/bold]"
         )
 
@@ -397,6 +465,104 @@ def _validate_single_session(session: AWSSession, label: str) -> bool:
             return True
         console.print(f"  [yellow]?[/yellow] {label}: unexpected error on write probe — {e}")
         return True  # treat unknown errors as acceptable; the key signal is "not write-success"
+
+
+@app.command()
+def discover(
+    profile: str = typer.Option(
+        None, "--profile", "-p",
+        help="AWS profile name. Omit to use the default credential chain.",
+    ),
+    region: str = typer.Option("us-east-1", "--region", "-r"),
+    member_role: str = typer.Option(
+        DEFAULT_MEMBER_ROLE, "--member-role",
+        help="Role name to check in member accounts.",
+    ),
+    check_assume: bool = typer.Option(
+        True, "--check-assume/--no-check-assume",
+        help="Test AssumeRole into each member account (slower but complete).",
+    ),
+    output: Path = typer.Option(None, "--output", "-o", help="Save CFN template to file"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Auto-detect account topology: single vs org, trail access, role availability.
+
+    Probes the environment and reports what BreakBot can reach. If member
+    accounts lack the scanning role, outputs a CloudFormation StackSet template.
+    """
+    _configure_logging(verbose)
+    from breakbot.org.discovery import EnvironmentDiscovery, generate_cfn_stackset_template
+
+    master = _build_master_session(profile, region)
+    console.rule("[bold cyan]BreakBot Environment Discovery")
+    console.print(f"Current account: [yellow]{master.account_id}[/yellow]")
+
+    discovery = EnvironmentDiscovery(master, member_role_name=member_role)
+    result = discovery.detect(check_assume=check_assume)
+
+    if not result.is_org:
+        console.print(f"\n[bold]Mode:[/bold] Single account")
+        if result.detection_error:
+            console.print(f"[dim]({result.detection_error})[/dim]")
+        console.print("\n[green]Ready to scan.[/green] Run: breakbot scan")
+        return
+
+    # Org mode
+    console.print(f"\n[bold]Mode:[/bold] Organization ({len(result.accounts)} active accounts)")
+
+    # Trail info
+    if result.org_trail:
+        trail = result.org_trail
+        if trail.is_accessible:
+            console.print(f"\n[green]Org Trail:[/green] {trail.trail_name}")
+            console.print(f"  S3 bucket: {trail.s3_bucket_name} [green](accessible)[/green]")
+        else:
+            console.print(f"\n[yellow]Org Trail:[/yellow] {trail.trail_name}")
+            console.print(f"  S3 bucket: {trail.s3_bucket_name} [red](not accessible)[/red]")
+            console.print(f"  Error: {trail.access_error}")
+    else:
+        console.print("\n[yellow]No Organization Trail found.[/yellow]")
+        console.print("  [dim]Behavioral analysis will use per-account LookupEvents (90 day limit).[/dim]")
+
+    # Account access
+    accessible = result.accessible_accounts
+    inaccessible = result.inaccessible_accounts
+
+    if accessible:
+        console.print(f"\n[green]Accessible accounts ({len(accessible)}):[/green]")
+        for a in accessible[:10]:
+            console.print(f"  {a.account_id} — {a.name}")
+        if len(accessible) > 10:
+            console.print(f"  ... and {len(accessible) - 10} more")
+
+    if inaccessible:
+        console.print(f"\n[red]Cannot assume '{member_role}' in {len(inaccessible)} account(s):[/red]")
+        tbl = Table(show_header=True)
+        tbl.add_column("Account ID")
+        tbl.add_column("Name")
+        tbl.add_column("Error")
+        for a in inaccessible:
+            tbl.add_row(a.account_id, a.name, a.assume_error or "unknown")
+        console.print(tbl)
+
+        console.print(f"\n[bold]To fix:[/bold] Deploy the '{member_role}' role to these accounts.")
+        console.print("Generate CloudFormation StackSet template:")
+        console.print(f"  [dim]breakbot discover --output stackset-template.yaml[/dim]")
+
+        if output:
+            template = generate_cfn_stackset_template(
+                audit_account_id=master.account_id,
+                role_name=member_role,
+            )
+            output.write_text(template, encoding="utf-8")
+            console.print(f"\n[green]Template saved to {output}[/green]")
+            console.print("Deploy via:")
+            console.print(f"  [dim]aws cloudformation create-stack-set --stack-set-name BreakBotRoles "
+                          f"--template-body file://{output} --capabilities CAPABILITY_NAMED_IAM[/dim]")
+
+    if not inaccessible:
+        console.print(f"\n[green]All {len(accessible)} accounts accessible. Ready to scan.[/green]")
+        console.print("  Run: breakbot scan --org")
 
 
 @app.command()
@@ -717,12 +883,19 @@ def report(
              "ENTRY POINTS / SINKS / PATHS are always preserved in full; "
              "ALL NODES / ALL EDGES sections truncate first.",
     ),
+    region: str = typer.Option("ap-south-1", "--region", "-r", help="AWS region for Bedrock"),
+    bedrock: bool = typer.Option(
+        True, "--bedrock/--no-bedrock",
+        help="Use AWS Bedrock for Claude API (default). "
+             "Use --no-bedrock + ANTHROPIC_API_KEY for direct Anthropic API.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
     """Generate an LLM-powered attack-path report from a completed scan.
 
     Requires the 'anthropic' package: pip install 'breakbot[llm]'
-    Set ANTHROPIC_API_KEY in your environment before running.
+    Default: uses AWS Bedrock (same credentials as scan).
+    Alternative: set ANTHROPIC_API_KEY and use --no-bedrock.
     """
     _configure_logging(verbose)
 
@@ -784,8 +957,9 @@ def report(
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1) from e
 
-    console.print(f"\n[bold]Calling Claude (claude-opus-4-7) for threat analysis...[/bold]")
-    analyst = SecurityAnalyst()
+    backend = "AWS Bedrock" if bedrock else "Anthropic API"
+    console.print(f"\n[bold]Calling Claude via {backend} for threat analysis...[/bold]")
+    analyst = SecurityAnalyst(use_bedrock=bedrock, region=region)
     analysis = analyst.analyze(attack_surface, posture_findings)
 
     # Determine output path

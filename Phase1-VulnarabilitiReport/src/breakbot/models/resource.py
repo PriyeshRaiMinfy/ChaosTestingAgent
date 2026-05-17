@@ -56,6 +56,9 @@ class ResourceType(str, Enum):
     NAT_GATEWAY = "ec2:nat-gateway"
     INTERNET_GATEWAY = "ec2:internet-gateway"
     LOAD_BALANCER_TARGET_GROUP = "elbv2:target-group"
+    ROUTE_TABLE = "ec2:route-table"
+    NETWORK_ACL = "ec2:network-acl"
+    VPC_PEERING_CONNECTION = "ec2:vpc-peering-connection"
     # DNS
     ROUTE53_HOSTED_ZONE = "route53:hosted-zone"
     # API Gateway

@@ -21,6 +21,7 @@ Two construction paths:
 from __future__ import annotations
 
 import logging
+import threading
 from typing import TYPE_CHECKING
 
 from boto3.session import Session
@@ -81,6 +82,7 @@ class AWSSession:
 
         self._default_region = region
         self._client_cache: dict[tuple[str, str], Any] = {}
+        self._client_lock = threading.Lock()
         self._account_id: str | None = account_id  # pre-set when assumed
         self._regions_cache: list[str] | None = None
 
@@ -144,15 +146,16 @@ class AWSSession:
     def client(self, service: str, region: str | None = None):
         """
         Returns a cached boto3 client for (service, region).
-        Caching matters — creating clients is expensive when scanning
-        15+ regions across 6+ services.
+        Thread-safe — multiple scanners may request clients concurrently.
         """
         region = region or self._default_region
         key = (service, region)
         if key not in self._client_cache:
-            self._client_cache[key] = self._session.client(
-                service, region_name=region, config=_BOTO_CONFIG
-            )
+            with self._client_lock:
+                if key not in self._client_cache:
+                    self._client_cache[key] = self._session.client(
+                        service, region_name=region, config=_BOTO_CONFIG
+                    )
         return self._client_cache[key]
 
     def enabled_regions(self) -> list[str]:

@@ -23,7 +23,8 @@ from breakbot.brain.report import AnalysisReport, AttackPath
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "claude-sonnet-4-6-20250514"
+_MODEL = "apac.anthropic.claude-sonnet-4-20250514-v1:0"
+_DIRECT_MODEL = "claude-sonnet-4-6-20250514"
 _TOOL_NAME = "record_security_analysis"
 
 _SYSTEM_PROMPT = """\
@@ -135,9 +136,13 @@ class SecurityAnalyst:
     """
     Calls Claude to reason over the serialized attack surface and produce
     a structured threat report. Schema is enforced server-side via tool use.
+
+    Supports two backends:
+      - AWS Bedrock (default): uses AWS credentials from environment/profile
+      - Direct Anthropic API: set ANTHROPIC_API_KEY env var
     """
 
-    def __init__(self, api_key: str | None = None) -> None:
+    def __init__(self, api_key: str | None = None, use_bedrock: bool = True, region: str = "ap-south-1") -> None:
         try:
             import anthropic as _anthropic
         except ImportError as e:
@@ -146,7 +151,13 @@ class SecurityAnalyst:
                 "Install it with: pip install 'breakbot[llm]'"
             ) from e
         self._anthropic = _anthropic
-        self._client = _anthropic.Anthropic(api_key=api_key) if api_key else _anthropic.Anthropic()
+
+        if api_key or not use_bedrock:
+            self._client = _anthropic.Anthropic(api_key=api_key) if api_key else _anthropic.Anthropic()
+            self._model = _DIRECT_MODEL
+        else:
+            self._client = _anthropic.AnthropicBedrock(aws_region=region)
+            self._model = _MODEL
 
     def analyze(
         self,
@@ -161,10 +172,10 @@ class SecurityAnalyst:
             AnalysisReport — guaranteed to match the tool schema
         """
         user_message = _build_user_message(attack_surface, posture_findings)
-        logger.info("Sending attack surface to Claude (%s)...", _MODEL)
+        logger.info("Sending attack surface to Claude (%s)...", self._model)
 
         with self._client.messages.stream(
-            model=_MODEL,
+            model=self._model,
             max_tokens=8192,
             tools=[_ANALYSIS_TOOL],
             tool_choice={"type": "tool", "name": _TOOL_NAME},

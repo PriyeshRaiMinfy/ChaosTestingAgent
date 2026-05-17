@@ -35,10 +35,9 @@ class ServerlessScanner(BaseScanner):
         resources: list[Resource] = []
 
         bus_names: list[str] = []
-        paginator = events.get_paginator("list_event_buses")
-        for page in paginator.paginate():
-            for bus in page.get("EventBuses", []):
-                bus_names.append(bus["Name"])
+        resp = events.list_event_buses()
+        for bus in resp.get("EventBuses", []):
+            bus_names.append(bus["Name"])
 
         for bus_name in bus_names:
             try:
