@@ -14,144 +14,155 @@ breakbot = "breakbot.cli.main:app"
 
 ## Commands
 
+### `breakbot discover`
+
+Auto-detects account topology: single vs org, trail access, role availability.
+
+```bash
+breakbot discover --profile breakbot
+breakbot discover --profile breakbot --output stackset-template.yaml
+```
+
+What it does:
+1. Tries `organizations:ListAccounts` + `DescribeOrganization`
+2. If org: finds Organization Trail + checks S3 bucket access
+3. Tests `sts:AssumeRole` into each member account
+4. Reports what's reachable and what's missing
+
+If member accounts lack the scanning role, outputs a CloudFormation StackSet template.
+
+---
+
 ### `breakbot validate`
 
 Verifies that the configured AWS profile has **read** access and **no write** access.
-Run this before your first scan to catch misconfigured credentials early.
 
 ```bash
 breakbot validate --profile breakbot --region us-east-1
+breakbot validate --profile breakbot --org   # validates every account
 ```
 
 What it does:
 1. Calls `ec2:DescribeInstances` — should succeed
 2. Calls `ec2:CreateTags` on a dummy resource — should fail with `AccessDenied`
 
-```
-Account: 123456789012
-✔ Read access works (ec2:DescribeInstances)
-✔ Write access correctly denied — profile is read-only
-```
-
-If step 2 **succeeds**, the profile has write permissions — the scan is aborted.
-Do not run BreakBot with a profile that has write access.
-
 ---
 
 ### `breakbot scan`
 
-Runs the full Phase 2 scanner against your AWS account.
+Runs a full read-only scan. Auto-detects org mode unless `--single` is passed.
 
 ```bash
-# Scan a single region, all domains
+# Single account
 breakbot scan --profile breakbot --region us-east-1
 
-# Scan every enabled region in the account
-breakbot scan --profile breakbot --all-regions
+# Force single even if org detected
+breakbot scan --profile breakbot --single
 
-# Scan only one domain (fast, useful for targeted checks)
-breakbot scan --profile breakbot --domain identity
-breakbot scan --profile breakbot --domain networking
+# Org-wide with CloudTrail behavioral events
+breakbot scan --profile breakbot --org --all-regions --trail
 
-# Verbose logging (debug-level, shows each boto3 call)
-breakbot scan --profile breakbot --region us-east-1 --verbose
+# Specific domains only
+breakbot scan --profile breakbot --domain identity --domain networking
+
+# Specific accounts in org
+breakbot scan --profile breakbot --org --account-id 111111111111 --account-id 222222222222
 ```
 
 **Options:**
 
 ```
---profile  -p   AWS profile name from ~/.aws/credentials  (default: "default")
---region   -r   Primary region to scan                    (default: us-east-1)
---all-regions   Scan all enabled regions in the account
---domain   -d   Restrict to one domain (repeatable):
-                  compute | networking | data | identity
---output   -o   Output directory                          (default: ./scans)
---verbose  -v   Enable debug logging
+--profile  -p     AWS profile name
+--region   -r     Primary region (default: us-east-1)
+--all-regions     Scan every enabled region
+--org             Force org-wide scan
+--single          Force single-account (skip auto-detection)
+--account-id      Repeatable. Filter to specific accounts in org mode
+--member-role     Role name in member accounts (default: BreakBotReadOnly)
+--external-id     ExternalId for member role trust policy
+--domain   -d     Restrict domains: compute, networking, data, identity,
+                  eks, secrets, containers, messaging, waf, dns, cognito,
+                  apigateway, cdn, serverless
+--trail           Fetch CloudTrail behavioral events (free management events)
+--trail-days      Lookback period (default: 90, max: 90)
+--output   -o     Output directory (default: ./scans)
+--verbose  -v     Debug logging
 ```
 
 **Output:**
 
 Creates `scans/scan-YYYYMMDD-HHMMSS-xxxxxx/` containing:
-
-```
-scans/scan-20250511-142300-a3f9b1/
-├── scan.json              ← Full ScanResult (all resources + errors)
-├── ec2_instance.json      ← EC2 instances only
-├── lambda_function.json   ← Lambda functions only
-├── s3_bucket.json
-├── rds_db-instance.json
-├── iam_role.json
-├── iam_user.json
-├── ec2_vpc.json
-├── ec2_security-group.json
-└── elbv2_load-balancer.json
-```
-
-Terminal output shows a summary table:
-
-```
-╔══════════════════════════╗
-║      Scan summary        ║
-╠══════════╦═══════╦═══════╣
-║ Domain   ║ Found ║ Errors║
-╠══════════╬═══════╬═══════╣
-║ compute  ║    12 ║     0 ║
-║ networking║    8  ║     0 ║
-║ data     ║     5 ║     1 ║
-║ identity ║    23 ║     0 ║
-║ TOTAL    ║    48 ║     1 ║
-╚══════════╩═══════╩═══════╝
-✔ Written to scans/scan-20250511-142300-a3f9b1
-```
+- `scan.json` — Full ScanResult
+- `posture.json` — Posture findings
+- `trail.json` — CloudTrail events (if `--trail`)
+- Per-type resource files for inspection
 
 ---
 
 ### `breakbot graph`
 
-Takes the output of a completed scan and builds the dependency graph.
+Builds the dependency graph from a completed scan.
 
 ```bash
-# Build graph, save HTML visualization and LLM-ready text
-breakbot graph scans/scan-20250511-142300-a3f9b1 \
-    --html graph.html \
-    --serialize attack_surface.txt
-
-# Just show the stats table (no files saved)
-breakbot graph scans/scan-20250511-142300-a3f9b1
-
-# Increase hop depth for larger accounts
-breakbot graph scans/scan-... --serialize text.txt --max-hops 7
+breakbot graph scans/scan-... --html graph.html --serialize attack_surface.txt
+breakbot graph scans/scan-... --max-hops 7
 ```
 
 **Options:**
 
 ```
-SCAN_DIR          Path to a scan output directory (required positional arg)
---html            Path to save interactive HTML visualization
---serialize  -s   Path to save LLM-ready compact text
---max-hops        Max path length for entry→sink BFS  (default: 5)
---verbose    -v   Enable debug logging
+SCAN_DIR          Path to scan output directory (required)
+--html            Save interactive HTML visualization
+--serialize  -s   Save LLM-ready compact text
+--max-hops        Max path length for entry→sink BFS (default: 5)
+--verbose    -v   Debug logging
 ```
 
-**Terminal output:**
+Automatically applies CloudTrail behavioral overlay if `trail.json` exists.
+
+---
+
+### `breakbot report`
+
+Generates an LLM-powered attack-path report from a completed scan.
+
+```bash
+# Default: Markdown via AWS Bedrock
+breakbot report scans/scan-...
+
+# JSON format, direct Anthropic API
+breakbot report scans/scan-... --format json --no-bedrock
+
+# Cap tokens for very large accounts
+breakbot report scans/scan-... --token-budget 200000
+```
+
+**Options:**
 
 ```
-Loading scan from scans/scan-.../scan.json
-Loaded 48 resources from account 123456789012
-Building dependency graph...
+SCAN_DIR          Path to scan output directory (required)
+--format   -f     Output format: md, json, html (default: md)
+--region   -r     AWS region for Bedrock (default: ap-south-1)
+--bedrock/--no-bedrock  Use Bedrock (default) or direct Anthropic API
+--token-budget    Cap tokens sent to Claude (0 = no cap)
+--output   -o     Output file path
+--verbose  -v     Debug logging
+```
 
-╔═════════════════════════════╗
-║       Graph summary         ║
-╠══════════════════════╦══════╣
-║ Total Nodes          ║   49 ║  ← 48 resources + 1 INTERNET virtual node
-║ Total Edges          ║   83 ║
-║ Entry Points         ║    3 ║
-║ Sinks                ║    7 ║
-║ Internet Exposed Sgs ║    2 ║
-╚══════════════════════╩══════╝
+Requires: `pip install 'breakbot[llm]'`
 
-✔ Visualization saved to graph.html
-✔ Serialization saved to attack_surface.txt
+Default backend: AWS Bedrock (uses same AWS credentials as scan).
+Alternative: set `ANTHROPIC_API_KEY` env var and use `--no-bedrock`.
+
+---
+
+### `breakbot posture`
+
+Re-runs posture analysis on a completed scan (no AWS calls).
+
+```bash
+breakbot posture scans/scan-...
+breakbot posture scans/scan-... --severity HIGH --category identity --verbose
 ```
 
 ---
@@ -159,33 +170,15 @@ Building dependency graph...
 ## Typical Workflow
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │                                     │
-  breakbot validate │  Check creds are read-only          │
-                    │                                     │
-                    └──────────────────┬──────────────────┘
-                                       │
-                    ┌──────────────────▼──────────────────┐
-                    │                                     │
-  breakbot scan     │  Discover all resources in account  │
-                    │  Output: scans/{id}/scan.json        │
-                    │                                     │
-                    └──────────────────┬──────────────────┘
-                                       │
-                    ┌──────────────────▼──────────────────┐
-                    │                                     │
-  breakbot graph    │  Build dependency graph             │
-                    │  Output: graph.html                 │
-                    │          attack_surface.txt         │
-                    │                                     │
-                    └──────────────────┬──────────────────┘
-                                       │
-                    ┌──────────────────▼──────────────────┐
-                    │                                     │
-  Phase 5 (TBD)     │  Feed attack_surface.txt to Claude  │
-                    │  Output: report.md                  │
-                    │                                     │
-                    └─────────────────────────────────────┘
+  breakbot discover    →  Understand topology, deploy missing roles
+         │
+  breakbot validate    →  Confirm read-only access
+         │
+  breakbot scan --trail →  Discover resources + behavioral events
+         │
+  breakbot graph       →  Build graph, visualize, serialize
+         │
+  breakbot report      →  Claude reasons over attack surface → report.md
 ```
 
 ---
@@ -200,7 +193,7 @@ Building dependency graph...
 ```python
 @app.command()
 def my_command(
-    profile: str = typer.Option("default", "--profile", "-p"),
+    profile: str = typer.Option(None, "--profile", "-p"),
 ):
     """One-line description shown in breakbot --help."""
     session = AWSSession(profile=profile)

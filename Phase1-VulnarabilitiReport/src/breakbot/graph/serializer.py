@@ -234,12 +234,14 @@ class GraphSerializer:
             has_igw = False
             nacl_blocks = False
 
-            # subnet → route_table
+            # subnet → route_table → check for IGW route edge
             for _, rt_target, edge_attrs in self.graph.out_edges(subnet_arn, data=True):
                 if edge_attrs.get("edge_type") == EdgeType.SUBNET_ROUTES_VIA:
-                    rt_attrs = self.graph.nodes.get(rt_target, {})
-                    if rt_attrs.get("has_igw_route"):
-                        has_igw = True
+                    # Check if RT has outgoing ROUTE_TO_IGW edge
+                    for _, _, rt_edge in self.graph.out_edges(rt_target, data=True):
+                        if rt_edge.get("edge_type") == EdgeType.ROUTE_TO_IGW:
+                            has_igw = True
+                            break
 
             # Check NACL → subnet (incoming edge to subnet)
             for nacl_src, _, edge_attrs in self.graph.in_edges(subnet_arn, data=True):
@@ -272,18 +274,6 @@ class GraphSerializer:
                 if attrs.get("has_wildcard_resource_access"):
                     if not _is_service_linked_or_aws_managed(node_id, attrs):
                         sinks.add(node_id)
-
-            elif t == ResourceType.SECRETS_MANAGER_SECRET.value:
-                sinks.add(node_id)
-
-            elif t == ResourceType.DYNAMODB_TABLE.value:
-                sinks.add(node_id)
-
-            elif t == ResourceType.KMS_KEY.value:
-                sinks.add(node_id)
-
-            elif t == ResourceType.SSM_PARAMETER.value:
-                sinks.add(node_id)
 
             elif t == ResourceType.SECRETS_MANAGER_SECRET.value:
                 sinks.add(node_id)

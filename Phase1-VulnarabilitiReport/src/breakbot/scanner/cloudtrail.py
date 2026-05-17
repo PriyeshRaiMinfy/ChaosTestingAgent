@@ -116,7 +116,9 @@ class CloudTrailScanner:
         ct = session.client("cloudtrail", region=region)
         events: list[TrailEvent] = []
 
-        for event_name in _EVENTS_OF_INTEREST:
+        for i, event_name in enumerate(_EVENTS_OF_INTEREST):
+            if i > 0:
+                time.sleep(0.6)  # rate limit: 2 TPS per region
             try:
                 events.extend(
                     self._lookup(ct, event_name, start_time, region, session.account_id)
@@ -136,6 +138,8 @@ class CloudTrailScanner:
 
         return events
 
+    _MAX_PAGES = 100  # safety limit against infinite pagination
+
     def _lookup(
         self,
         ct,
@@ -153,14 +157,13 @@ class CloudTrailScanner:
             "MaxResults": 50,
         }
 
-        while True:
+        for _ in range(self._MAX_PAGES):
             resp = ct.lookup_events(**kwargs)
 
             for raw in resp.get("Events", []):
                 event = _parse_event(raw, region, account_id)
                 if event:
                     results.append(event)
-                    # Expand multi-target events (e.g. GetParameters with N params)
                     ct_json = raw.get("CloudTrailEvent", "")
                     if ct_json:
                         try:
@@ -187,6 +190,11 @@ class CloudTrailScanner:
 
             kwargs["NextToken"] = next_token
             time.sleep(0.6)  # stay under 2 TPS rate limit
+        else:
+            logger.warning(
+                "CloudTrail %s in %s: hit %d page limit, results may be incomplete",
+                event_name, region, self._MAX_PAGES,
+            )
 
         return results
 
@@ -322,11 +330,16 @@ class OrgTrailS3Reader:
       - No per-account AssumeRole needed for trail data
       - Higher throughput (S3 pagination vs. 2 TPS rate limit)
 
-    S3 key structure:
+    S3 key structure (with org):
       {prefix}/AWSLogs/{org_id}/{account_id}/CloudTrail/{region}/YYYY/MM/DD/*.json.gz
+    S3 key structure (without org):
+      AWSLogs/{account_id}/CloudTrail/{region}/YYYY/MM/DD/*.json.gz
+
+    The `prefix` param is the CloudTrail S3KeyPrefix configured on the trail
+    (the part BEFORE "AWSLogs"). Pass None or "" if the trail has no custom prefix.
 
     Usage:
-        reader = OrgTrailS3Reader(session, bucket="org-trail-bucket", prefix="AWSLogs")
+        reader = OrgTrailS3Reader(session, bucket="org-trail-bucket", prefix="my-prefix")
         events = reader.read(lookback_days=90, account_ids=["123...", "456..."])
     """
 
@@ -383,9 +396,7 @@ class OrgTrailS3Reader:
                             raw_bytes = gzip.decompress(resp["Body"].read())
                             log_data = json.loads(raw_bytes)
                             for record in log_data.get("Records", []):
-                                event = self._parse_s3_record(record)
-                                if event:
-                                    all_events.append(event)
+                                all_events.extend(self._parse_s3_record(record))
                         except Exception as e:
                             logger.debug("Failed to parse %s: %s", key, e)
             except Exception as e:
@@ -407,11 +418,14 @@ class OrgTrailS3Reader:
         from datetime import date, timedelta as td
 
         prefixes: list[str] = []
-        base = self._prefix.rstrip("/")
+        # Build root: "{prefix}/AWSLogs" or just "AWSLogs" if no custom prefix
+        base = self._prefix.strip("/") if self._prefix else ""
+        root = f"{base}/AWSLogs" if base else "AWSLogs"
 
-        # If we don't know accounts/regions, scan at the org level
-        # CloudTrail S3 structure: {prefix}/AWSLogs/{org_id}/{acct}/{region}/...
-        # or without org: {prefix}/AWSLogs/{acct}/CloudTrail/{region}/...
+        # CloudTrail S3 structure:
+        #   {root}/{org_id}/{acct}/CloudTrail/{region}/YYYY/MM/DD/*.json.gz
+        # or without org:
+        #   {root}/{acct}/CloudTrail/{region}/YYYY/MM/DD/*.json.gz
         current = start_date
         today = date.today()
 
@@ -426,39 +440,39 @@ class OrgTrailS3Reader:
                         for reg in regions:
                             if self._org_id:
                                 prefixes.append(
-                                    f"{base}/AWSLogs/{self._org_id}/{acct}/CloudTrail/{reg}/{year}/{month}/{day}/"
+                                    f"{root}/{self._org_id}/{acct}/CloudTrail/{reg}/{year}/{month}/{day}/"
                                 )
                             else:
                                 prefixes.append(
-                                    f"{base}/AWSLogs/{acct}/CloudTrail/{reg}/{year}/{month}/{day}/"
+                                    f"{root}/{acct}/CloudTrail/{reg}/{year}/{month}/{day}/"
                                 )
                     else:
                         if self._org_id:
                             prefixes.append(
-                                f"{base}/AWSLogs/{self._org_id}/{acct}/CloudTrail/"
+                                f"{root}/{self._org_id}/{acct}/CloudTrail/"
                             )
                         else:
                             prefixes.append(
-                                f"{base}/AWSLogs/{acct}/CloudTrail/"
+                                f"{root}/{acct}/CloudTrail/"
                             )
                         break  # only need one prefix per account if no region filter
             else:
                 # Broad scan — prefix by date across all accounts
                 if self._org_id:
-                    prefixes.append(f"{base}/AWSLogs/{self._org_id}/")
+                    prefixes.append(f"{root}/{self._org_id}/")
                 else:
-                    prefixes.append(f"{base}/AWSLogs/")
+                    prefixes.append(f"{root}/")
                 break  # single broad prefix is enough
 
             current += td(days=1)
 
         return prefixes
 
-    def _parse_s3_record(self, record: dict) -> TrailEvent | None:
-        """Parse a single CloudTrail record from S3 JSON log."""
+    def _parse_s3_record(self, record: dict) -> list[TrailEvent]:
+        """Parse a single CloudTrail record from S3 JSON log. Expands multi-target events."""
         event_name = record.get("eventName", "")
         if event_name not in _EVENTS_OF_INTEREST:
-            return None
+            return []
 
         user_identity = record.get("userIdentity") or {}
         account_id = record.get("recipientAccountId") or user_identity.get("accountId", "")
@@ -468,16 +482,17 @@ class OrgTrailS3Reader:
             user_identity.get("arn", ""), account_id
         )
         if not actor_arn:
-            return None
+            return []
 
         target_arn = _extract_target_arn(
             event_name, record, region, account_id
         )
         source_ip = record.get("sourceIPAddress")
         event_time = record.get("eventTime", "")
+        event_id = record.get("eventID", "")
 
         event = TrailEvent(
-            event_id=record.get("eventID", ""),
+            event_id=event_id,
             event_name=event_name,
             event_time=event_time,
             actor_arn=actor_arn,
@@ -486,7 +501,18 @@ class OrgTrailS3Reader:
             account_id=account_id,
             source_ip=source_ip,
         )
+        results = [event]
 
-        # Also expand GetParameters multi-target
-        # (caller handles this — we return just the primary event here)
-        return event
+        for extra_arn in _extract_additional_targets(event_name, record, region, account_id):
+            results.append(TrailEvent(
+                event_id=event_id,
+                event_name=event_name,
+                event_time=event_time,
+                actor_arn=actor_arn,
+                target_arn=extra_arn,
+                region=region,
+                account_id=account_id,
+                source_ip=source_ip,
+            ))
+
+        return results

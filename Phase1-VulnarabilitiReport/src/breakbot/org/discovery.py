@@ -52,6 +52,7 @@ class DiscoveryResult:
     """Complete discovery output — everything needed to decide scan strategy."""
     is_org: bool
     current_account_id: str
+    org_id: str | None = None
     accounts: list[AccountInfo] = field(default_factory=list)
     org_trail: OrgTrailInfo | None = None
     detection_error: str | None = None
@@ -95,7 +96,7 @@ class EnvironmentDiscovery:
         current_account = self._session.account_id
 
         # Step 1: Org detection
-        is_org, accounts, detection_error = self._detect_org()
+        is_org, accounts, detection_error, org_id = self._detect_org()
 
         if not is_org:
             return DiscoveryResult(
@@ -114,14 +115,24 @@ class EnvironmentDiscovery:
         return DiscoveryResult(
             is_org=True,
             current_account_id=current_account,
+            org_id=org_id,
             accounts=accounts,
             org_trail=org_trail,
         )
 
-    def _detect_org(self) -> tuple[bool, list[AccountInfo], str | None]:
-        """Try ListAccounts. Returns (is_org, accounts, error_if_not_org)."""
+    def _detect_org(self) -> tuple[bool, list[AccountInfo], str | None, str | None]:
+        """Try DescribeOrganization + ListAccounts. Returns (is_org, accounts, error, org_id)."""
         try:
             orgs = self._session.client("organizations", region="us-east-1")
+
+            # Get org ID first
+            org_id: str | None = None
+            try:
+                desc = orgs.describe_organization()
+                org_id = desc.get("Organization", {}).get("Id")
+            except ClientError:
+                pass  # proceed without org_id — non-fatal
+
             paginator = orgs.get_paginator("list_accounts")
             accounts: list[AccountInfo] = []
             for page in paginator.paginate():
@@ -134,15 +145,15 @@ class EnvironmentDiscovery:
                         email=acct["Email"],
                         status=acct["Status"],
                     ))
-            logger.info("Org detected: %d active accounts", len(accounts))
-            return True, accounts, None
+            logger.info("Org detected: %d active accounts (org_id=%s)", len(accounts), org_id)
+            return True, accounts, None, org_id
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
             if code == "AWSOrganizationsNotInUseException":
-                return False, [], "Account is not in an AWS Organization"
+                return False, [], "Account is not in an AWS Organization", None
             if code == "AccessDeniedException":
-                return False, [], "No organizations:ListAccounts permission (may still be in org)"
-            return False, [], f"Org detection failed: {code}"
+                return False, [], "No organizations:ListAccounts permission (may still be in org)", None
+            return False, [], f"Org detection failed: {code}", None
 
     def _find_org_trail(self) -> OrgTrailInfo | None:
         """Find Organization Trail and check if its S3 bucket is readable."""
