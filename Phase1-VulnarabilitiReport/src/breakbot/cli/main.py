@@ -162,7 +162,7 @@ def _scan_single_account(
         console.print(f"  [dim]Scanning {len(selected_domains)} domains in parallel (workers={max_workers})[/dim]")
         for future in as_completed(futures):
             name, resources, errors = future.result()
-            console.print(f"  [bold]✔ {name}[/bold] — {len(resources)} resources")
+            console.print(f"  [bold]+ {name}[/bold] — {len(resources)} resources")
             account_resources.extend(resources)
             account_errors.extend(errors)
             summary_rows.append((session.account_id, name, len(resources), len(errors)))
@@ -219,13 +219,23 @@ def scan(
     ),
     trail: bool = typer.Option(
         False, "--trail",
-        help="Also fetch CloudTrail behavioral events (last 90 days). "
+        help="Also fetch CloudTrail behavioral events. "
              "Writes trail.json alongside scan.json. No extra AWS cost — "
              "uses management events only.",
     ),
     trail_days: int = typer.Option(
-        90, "--trail-days",
-        help="How many days of CloudTrail history to fetch (max 90).",
+        14, "--trail-days",
+        help="How many days of CloudTrail history to fetch (max 90). Default 14.",
+    ),
+    trail_regions: str = typer.Option(
+        "", "--trail-regions",
+        help="Comma-separated regions for CloudTrail lookup. "
+             "Default: scan region + us-east-1. Use 'all' for all enabled regions.",
+    ),
+    trail_max_pages: int = typer.Option(
+        20, "--trail-max-pages",
+        help="Max pagination pages per event type per region. "
+             "Default 20 (~1000 events/type). Use 100 for deep audit.",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
 ):
@@ -308,7 +318,7 @@ def scan(
         if org:
             session = factory.try_session_for(acct_id, region=region)
             if session is None:
-                console.print(f"  [yellow]⚠ Cannot assume {member_role} — skipping[/yellow]")
+                console.print(f"  [yellow]! Cannot assume {member_role} — skipping[/yellow]")
                 all_errors.append({
                     "account_id": acct_id,
                     "domain": "org",
@@ -387,7 +397,7 @@ def scan(
     )
     _print_posture_summary(console, posture_findings)
     console.print(
-        f"[green]✔[/green] Posture findings written to [bold]{scan_dir / 'posture.json'}[/bold]"
+        f"[green]+[/green] Posture findings written to [bold]{scan_dir / 'posture.json'}[/bold]"
     )
 
     # CloudTrail behavioral overlay (optional — only when --trail is set)
@@ -397,6 +407,21 @@ def scan(
         trail_scanner = CloudTrailScanner()
         days = min(trail_days, 90)
         trail_events: list[TrailEvent] = []
+
+        # Determine which regions to query CloudTrail in
+        if trail_regions.strip().lower() == "all":
+            ct_regions = master.enabled_regions()
+        elif trail_regions.strip():
+            ct_regions = [r.strip() for r in trail_regions.split(",") if r.strip()]
+        else:
+            # Default: scan region + us-east-1 (global service events)
+            ct_regions = sorted(set([region, "us-east-1"]))
+
+        console.print(
+            f"  [dim]CloudTrail plan: {len(ct_regions)} region(s), "
+            f"{days} days, max {trail_max_pages} pages/event[/dim]"
+        )
+        console.print(f"  [dim]Regions: {', '.join(ct_regions)}[/dim]")
 
         if org and factory:
             # Org mode: prefer S3 org trail if accessible, else per-account LookupEvents
@@ -418,7 +443,7 @@ def scan(
                 trail_events = reader.read(
                     lookback_days=days,
                     account_ids=accounts_actually_scanned,
-                    regions=list(regions_seen),
+                    regions=ct_regions,
                 )
             else:
                 # Fallback: per-account LookupEvents
@@ -441,11 +466,15 @@ def scan(
                         if sess is None:
                             continue
                     console.print(f"  [dim]CloudTrail: {acct_id}...[/dim]")
-                    acct_events = trail_scanner.scan(sess, list(regions_seen), lookback_days=days)
+                    acct_events = trail_scanner.scan(
+                        sess, ct_regions, lookback_days=days, max_pages=trail_max_pages
+                    )
                     trail_events.extend(acct_events)
         else:
             # Single account mode
-            trail_events = trail_scanner.scan(master, list(regions_seen), lookback_days=days)
+            trail_events = trail_scanner.scan(
+                master, ct_regions, lookback_days=days, max_pages=trail_max_pages
+            )
 
         trail_dicts = [e.to_dict() for e in trail_events]
         (scan_dir / "trail.json").write_text(json.dumps(trail_dicts, indent=2))
@@ -454,7 +483,7 @@ def scan(
             f"[bold]{scan_dir / 'trail.json'}[/bold]"
         )
 
-    console.print(f"\n[green]✔[/green] Written to [bold]{scan_dir}[/bold]")
+    console.print(f"\n[green]+[/green] Written to [bold]{scan_dir}[/bold]")
 
 
 def _validate_single_session(session: AWSSession, label: str) -> bool:
@@ -465,7 +494,7 @@ def _validate_single_session(session: AWSSession, label: str) -> bool:
     # Positive: should work
     try:
         ec2.describe_instances(MaxResults=5)
-        console.print(f"  [green]✔[/green] {label}: read access works")
+        console.print(f"  [green]+[/green] {label}: read access works")
     except Exception as e:
         console.print(f"  [red]✘[/red] {label}: read access FAILED — {e}")
         return False
@@ -478,7 +507,7 @@ def _validate_single_session(session: AWSSession, label: str) -> bool:
     except Exception as e:
         msg = str(e)
         if "AccessDenied" in msg or "UnauthorizedOperation" in msg:
-            console.print(f"  [green]✔[/green] {label}: write correctly denied")
+            console.print(f"  [green]+[/green] {label}: write correctly denied")
             return True
         console.print(f"  [yellow]?[/yellow] {label}: unexpected error on write probe — {e}")
         return True  # treat unknown errors as acceptable; the key signal is "not write-success"
@@ -645,7 +674,7 @@ def validate(
         console.print(f"[bold cyan]{acct_id}[/bold cyan] [dim]{acct['Name']}[/dim]")
         sess = factory.try_session_for(acct_id, region=region)
         if sess is None:
-            console.print(f"  [yellow]⚠[/yellow] Cannot assume {member_role}")
+            console.print(f"  [yellow]![/yellow] Cannot assume {member_role}")
             unreachable.append(acct_id)
             continue
         if not _validate_single_session(sess, acct_id):
@@ -700,7 +729,7 @@ def graph(
         trail_events = [TrailEvent.from_dict(e) for e in raw_events]
         behavioral_edges = TrailOverlay().apply(g, builder.arn_index, trail_events)
         console.print(
-            f"[green]✔[/green] {behavioral_edges} behavioral edge(s) added "
+            f"[green]+[/green] {behavioral_edges} behavioral edge(s) added "
             f"from {len(trail_events)} CloudTrail event(s)"
         )
     else:
@@ -724,14 +753,14 @@ def graph(
             from breakbot.graph.visualize import render_html
             console.print(f"Rendering HTML to [bold]{html}[/bold]")
             render_html(g, html)
-            console.print(f"[green]✔[/green] Visualization saved to {html}")
+            console.print(f"[green]+[/green] Visualization saved to {html}")
         except ImportError as e:
             console.print(f"[yellow]Skipping HTML output:[/yellow] {e}")
 
     if serialize:
         console.print(f"Serializing graph for LLM to [bold]{serialize}[/bold]")
         serializer.save(serialize)
-        console.print(f"[green]✔[/green] Serialization saved to {serialize}")
+        console.print(f"[green]+[/green] Serialization saved to {serialize}")
 
     if not html and not serialize:
         console.print("\n[dim]Tip: use --html graph.html or --serialize attack_surface.txt[/dim]")
@@ -867,7 +896,7 @@ def posture(
 
     dest = output or (scan_dir / "posture.json")
     dest.write_text(json.dumps([f.to_dict() for f in findings], indent=2))
-    console.print(f"[green]✔[/green] {len(findings)} finding(s) written to [bold]{dest}[/bold]")
+    console.print(f"[green]+[/green] {len(findings)} finding(s) written to [bold]{dest}[/bold]")
 
     # Print individual findings if verbose
     if verbose:
@@ -892,14 +921,6 @@ def report(
         help="Write report to this file. Defaults to report.md / report.json in the scan dir.",
     ),
     max_hops: int = typer.Option(5, "--max-hops", help="Max path length for attack surface graph"),
-    token_budget: int = typer.Option(
-        0, "--token-budget",
-        help="Cap the attack-surface text sent to Claude (rough tokens). "
-             "0 = no cap. 200000 is a reasonable default for very large accounts "
-             "(leaves room for the system prompt + response within Opus 4.7's 1M window). "
-             "ENTRY POINTS / SINKS / PATHS are always preserved in full; "
-             "ALL NODES / ALL EDGES sections truncate first.",
-    ),
     region: str = typer.Option("ap-south-1", "--region", "-r", help="AWS region for Bedrock"),
     bedrock: bool = typer.Option(
         True, "--bedrock/--no-bedrock",
@@ -946,24 +967,27 @@ def report(
         raw_events = json.loads(trail_file.read_text())
         trail_events = [TrailEvent.from_dict(e) for e in raw_events]
         behavioral_edges = TrailOverlay().apply(g, builder.arn_index, trail_events)
-        console.print(f"[green]✔[/green] {behavioral_edges} behavioral edge(s) added")
+        console.print(f"[green]+[/green] {behavioral_edges} behavioral edge(s) added")
 
     from breakbot.graph import GraphSerializer
     serializer = GraphSerializer(g, builder.arn_index, max_hops=max_hops)
-    # tokens ≈ chars / 3 for English; 0 means no cap
-    max_chars = token_budget * 3 if token_budget > 0 else None
-    attack_surface = serializer.serialize(max_chars=max_chars)
-    if max_chars is not None and len(attack_surface) >= max_chars:
-        console.print(
-            f"[yellow]⚠ Attack surface truncated to fit ~{token_budget} tokens "
-            f"({len(attack_surface)} chars)[/yellow]"
-        )
+    attack_surface = serializer.serialize_for_llm()
+    console.print(
+        f"  Attack surface for LLM: [yellow]{len(attack_surface):,} chars "
+        f"(~{len(attack_surface) // 3:,} tokens)[/yellow]"
+    )
 
-    # Load posture findings
+    # Load posture findings (cap at top 50 by severity for LLM)
+    _SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     posture_findings: list[dict] = []
     if posture_file.exists():
-        posture_findings = json.loads(posture_file.read_text())
-        console.print(f"Loaded [yellow]{len(posture_findings)}[/yellow] posture finding(s)")
+        all_findings = json.loads(posture_file.read_text())
+        all_findings.sort(key=lambda f: _SEVERITY_ORDER.get(f.get("severity", "INFO"), 9))
+        posture_findings = all_findings[:50]
+        console.print(
+            f"Loaded [yellow]{len(all_findings)}[/yellow] posture finding(s), "
+            f"sending top [yellow]{len(posture_findings)}[/yellow] to Claude"
+        )
     else:
         console.print("[yellow]No posture.json found — run 'breakbot posture' first[/yellow]")
 
@@ -990,7 +1014,7 @@ def report(
     else:
         dest.write_text(analysis.to_markdown(), encoding="utf-8")
 
-    console.print(f"\n[green]✔[/green] Report written to [bold]{dest}[/bold]")
+    console.print(f"\n[green]+[/green] Report written to [bold]{dest}[/bold]")
     console.print(f"Overall severity: [bold red]{analysis.overall_severity}[/bold red]")
     console.print(f"Attack paths identified: [bold]{len(analysis.attack_paths)}[/bold]")
 

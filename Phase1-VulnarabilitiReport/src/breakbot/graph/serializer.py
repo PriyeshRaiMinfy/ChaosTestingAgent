@@ -1,27 +1,18 @@
 """
-GraphSerializer — converts the dependency graph into a compact text format
-optimised for LLM context windows.
+GraphSerializer — two serialization modes:
 
-Output format (roughly 10× more token-efficient than nested JSON):
+  serialize()         Full graph (all nodes + edges). For humans / graph --serialize.
+  serialize_for_llm() Attack-focused (entry/sinks/paths/behavioral only). For Claude.
+
+LLM output format:
 
   === ENTRY POINTS ===
-  NODE arn:aws:elbv2:...:loadbalancer/app/prod-alb [ALB] internet_facing=true dns=prod-alb.elb.amazonaws.com
-  NODE arn:aws:ec2:...:instance/i-abc [EC2_INSTANCE] public_ip=1.2.3.4 imds_v1=true
-
   === SENSITIVE SINKS ===
-  NODE arn:aws:rds:...:db:prod-db [RDS_INSTANCE] engine=postgres encrypted=true
-
+  === BEHAVIORAL EVIDENCE (CloudTrail-proven activity) ===
+  === SELF-EXPOSED RESOURCES ===
   === ATTACK SURFACE PATHS (entry → sink, ≤N hops) ===
-  PATH  arn:.../prod-alb  →  arn:.../LambdaRole  →  arn:.../prod-db
-    EDGE  arn:.../prod-alb  --[attached_to_sg]-->  arn:.../sg-web
-    EDGE  INTERNET          --[internet_exposes port=443]-->  arn:.../sg-web
-    ...
-
-  === ALL NODES ===
-  ...
-
-  === ALL EDGES ===
-  ...
+  === PATH-RELEVANT NODES ===
+  === PATH-RELEVANT EDGES ===
 """
 from __future__ import annotations
 
@@ -88,33 +79,48 @@ class GraphSerializer:
 
     # ─────────────────────────── Public API ───────────────────────────────
 
-    def serialize(self, max_chars: int | None = None) -> str:
+    def serialize(self) -> str:
         """
-        Return the LLM-ready text representation.
-
-        Args:
-            max_chars: optional upper bound on output size. When set, ALL NODES
-                and ALL EDGES sections are truncated to fit, while ENTRY POINTS,
-                SENSITIVE SINKS, and ATTACK SURFACE PATHS are always preserved
-                in full (they're the high-signal sections — a truncated path
-                section would defeat the purpose).
-
-                Rough heuristic: tokens ≈ chars / 3 for English. For a 200K-token
-                user-message budget on Claude Opus 4.7, pass max_chars ≈ 600_000.
+        Full graph serialization — all nodes and edges. For human inspection
+        (graph --serialize) and debugging. Not suitable for LLM context.
         """
         buf = StringIO()
 
         entry_points = self._find_entry_points()
         sinks = self._find_sinks()
 
-        # Bounded, always-rendered sections
         self._write_entry_points(buf, entry_points)
         self._write_sinks(buf, sinks)
+        self._write_behavioral_edges(buf)
         self._write_attack_paths(buf, entry_points, sinks)
+        self._write_all_nodes(buf)
+        self._write_all_edges(buf)
 
-        # Unbounded sections — can be truncated under a budget
-        self._write_all_nodes(buf, remaining=_remaining(max_chars, buf))
-        self._write_all_edges(buf, remaining=_remaining(max_chars, buf))
+        return buf.getvalue()
+
+    def serialize_for_llm(self) -> str:
+        """
+        Attack-focused serialization for LLM context. Only includes:
+          - Entry points
+          - Sinks
+          - Self-exposed resources
+          - Behavioral evidence (CloudTrail-proven)
+          - Attack paths (entry → sink)
+          - Path-relevant nodes and edges (only those on attack paths)
+
+        Does NOT include every subnet, SG, IAM role, route table, etc.
+        Full graph available via serialize() for human visualization.
+        """
+        buf = StringIO()
+
+        entry_points = self._find_entry_points()
+        sinks = self._find_sinks()
+
+        self._write_entry_points(buf, entry_points)
+        self._write_sinks(buf, sinks)
+        self._write_behavioral_edges(buf)
+        self._write_attack_paths(buf, entry_points, sinks)
+        self._write_path_relevant_context(buf, entry_points, sinks)
 
         return buf.getvalue()
 
@@ -307,6 +313,22 @@ class GraphSerializer:
             buf.write(f"  {self._node_line(arn)}\n")
         buf.write("\n")
 
+    def _write_behavioral_edges(self, buf: StringIO) -> None:
+        behavioral_types = {
+            EdgeType.ACTUALLY_ASSUMED.value,
+            EdgeType.ACTUALLY_ACCESSED.value,
+        }
+        edges = [
+            (u, v, attrs) for u, v, attrs in self.graph.edges(data=True)
+            if attrs.get("edge_type") in behavioral_types
+        ]
+        if not edges:
+            return
+        buf.write("=== BEHAVIORAL EVIDENCE (CloudTrail-proven activity) ===\n")
+        for u, v, attrs in sorted(edges, key=lambda e: (e[0], e[1])):
+            buf.write(f"  {self._edge_line(u, v, attrs)}\n")
+        buf.write("\n")
+
     def _write_attack_paths(
         self,
         buf: StringIO,
@@ -355,6 +377,47 @@ class GraphSerializer:
         if path_count == 0:
             buf.write("  (no paths found between entry points and sinks)\n")
         buf.write("\n")
+
+    def _write_path_relevant_context(
+        self,
+        buf: StringIO,
+        entry_points: set[str],
+        sinks: set[str],
+    ) -> None:
+        """Write only nodes/edges that appear on at least one entry→sink path."""
+        path_nodes: set[str] = set()
+        path_edges: set[tuple[str, str]] = set()
+
+        for src in entry_points:
+            for dst in sinks:
+                if src == dst:
+                    continue
+                try:
+                    for path in nx.all_simple_paths(
+                        self.graph, src, dst, cutoff=self.max_hops
+                    ):
+                        for node in path:
+                            path_nodes.add(node)
+                        for i in range(len(path) - 1):
+                            path_edges.add((path[i], path[i + 1]))
+                except nx.NetworkXError:
+                    continue
+
+        # Nodes on paths that aren't already shown as entry points or sinks
+        context_nodes = path_nodes - entry_points - sinks
+        if context_nodes:
+            buf.write("=== PATH-RELEVANT NODES (on attack paths) ===\n")
+            for arn in sorted(context_nodes):
+                buf.write(f"  {self._node_line(arn)}\n")
+            buf.write("\n")
+
+        # Edges on paths
+        if path_edges:
+            buf.write("=== PATH-RELEVANT EDGES ===\n")
+            for u, v in sorted(path_edges):
+                for edge_attrs in self.graph[u][v].values():
+                    buf.write(f"  {self._edge_line(u, v, edge_attrs)}\n")
+            buf.write("\n")
 
     # ───────────────────────── Path ranking ───────────────────────────────
 
@@ -418,37 +481,19 @@ class GraphSerializer:
         scored.sort(key=lambda t: (-t[1], len(t[0]), str(t[0])))
         return scored
 
-    def _write_all_nodes(self, buf: StringIO, remaining: int | None = None) -> None:
+    def _write_all_nodes(self, buf: StringIO) -> None:
         buf.write("=== ALL NODES ===\n")
-        total = self.graph.number_of_nodes()
-        written = 0
         for node_id, _attrs in sorted(self.graph.nodes(data=True)):
-            line = f"  {self._node_line(node_id)}\n"
-            if remaining is not None and len(line) > remaining:
-                buf.write(f"  [truncated: {written} of {total} nodes shown — budget exhausted]\n")
-                break
-            buf.write(line)
-            if remaining is not None:
-                remaining -= len(line)
-            written += 1
+            buf.write(f"  {self._node_line(node_id)}\n")
         buf.write("\n")
 
-    def _write_all_edges(self, buf: StringIO, remaining: int | None = None) -> None:
+    def _write_all_edges(self, buf: StringIO) -> None:
         buf.write("=== ALL EDGES ===\n")
-        total = self.graph.number_of_edges()
-        written = 0
         for u, v, attrs in sorted(
             self.graph.edges(data=True),
             key=lambda e: (e[0], e[1]),
         ):
-            line = f"  {self._edge_line(u, v, attrs)}\n"
-            if remaining is not None and len(line) > remaining:
-                buf.write(f"  [truncated: {written} of {total} edges shown — budget exhausted]\n")
-                break
-            buf.write(line)
-            if remaining is not None:
-                remaining -= len(line)
-            written += 1
+            buf.write(f"  {self._edge_line(u, v, attrs)}\n")
         buf.write("\n")
 
     # ──────────────────────── Line Formatters ─────────────────────────────
@@ -577,11 +622,6 @@ class GraphSerializer:
 # ─────────────────────────── Module helpers ───────────────────────────────
 
 
-def _remaining(max_chars: int | None, buf: StringIO) -> int | None:
-    """Chars left in the buffer's budget. None = unlimited (no truncation)."""
-    if max_chars is None:
-        return None
-    return max(0, max_chars - len(buf.getvalue()))
 
 
 def _kv(parts: list[str], key: str, value: object) -> None:
