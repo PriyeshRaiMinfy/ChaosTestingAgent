@@ -85,14 +85,15 @@ class CloudTrailScanner:
         self,
         session,
         regions: list[str],
-        lookback_days: int = 90,
+        lookback_days: int = 14,
+        max_pages: int = 20,
     ) -> list[TrailEvent]:
         all_events: list[TrailEvent] = []
         start_time = datetime.utcnow() - timedelta(days=lookback_days)
 
         for region in regions:
             try:
-                events = self._scan_region(session, region, start_time)
+                events = self._scan_region(session, region, start_time, max_pages)
                 all_events.extend(events)
                 logger.info(
                     "CloudTrail: %d events in %s", len(events), region
@@ -112,6 +113,7 @@ class CloudTrailScanner:
         session,
         region: str,
         start_time: datetime,
+        max_pages: int = 20,
     ) -> list[TrailEvent]:
         ct = session.client("cloudtrail", region=region)
         events: list[TrailEvent] = []
@@ -121,7 +123,7 @@ class CloudTrailScanner:
                 time.sleep(0.6)  # rate limit: 2 TPS per region
             try:
                 events.extend(
-                    self._lookup(ct, event_name, start_time, region, session.account_id)
+                    self._lookup(ct, event_name, start_time, region, session.account_id, max_pages)
                 )
             except ClientError as e:
                 code = e.response["Error"]["Code"]
@@ -138,7 +140,7 @@ class CloudTrailScanner:
 
         return events
 
-    _MAX_PAGES = 100  # safety limit against infinite pagination
+    _MAX_PAGES = 100  # absolute safety cap
 
     def _lookup(
         self,
@@ -147,6 +149,7 @@ class CloudTrailScanner:
         start_time: datetime,
         region: str,
         account_id: str,
+        max_pages: int = 20,
     ) -> list[TrailEvent]:
         results: list[TrailEvent] = []
         kwargs: dict = {
@@ -156,8 +159,9 @@ class CloudTrailScanner:
             "StartTime": start_time,
             "MaxResults": 50,
         }
+        page_limit = min(max_pages, self._MAX_PAGES)
 
-        for _ in range(self._MAX_PAGES):
+        for _ in range(page_limit):
             resp = ct.lookup_events(**kwargs)
 
             for raw in resp.get("Events", []):
@@ -193,7 +197,7 @@ class CloudTrailScanner:
         else:
             logger.warning(
                 "CloudTrail %s in %s: hit %d page limit, results may be incomplete",
-                event_name, region, self._MAX_PAGES,
+                event_name, region, page_limit,
             )
 
         return results
