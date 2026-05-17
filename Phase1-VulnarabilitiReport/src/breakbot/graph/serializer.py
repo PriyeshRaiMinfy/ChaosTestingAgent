@@ -189,11 +189,20 @@ class GraphSerializer:
                         entry_points.add(node_id)
 
         # Resources attached to internet-exposed security groups
+        _SUBNET_VALIDATED_TYPES = {
+            ResourceType.EC2_INSTANCE.value,
+            ResourceType.ECS_SERVICE.value,
+        }
         for sg_arn in self.graph.successors(INTERNET_NODE_ID):
             for resource_arn in self.graph.predecessors(sg_arn):
                 attrs = self.graph.nodes.get(resource_arn, {})
-                if attrs.get("type") in _INTERNET_FACING_TYPES:
-                    entry_points.add(resource_arn)
+                rtype = attrs.get("type")
+                if rtype not in _INTERNET_FACING_TYPES:
+                    continue
+                if rtype in _SUBNET_VALIDATED_TYPES:
+                    if not self._subnet_confirms_public(resource_arn):
+                        continue
+                entry_points.add(resource_arn)
 
         return entry_points
 
