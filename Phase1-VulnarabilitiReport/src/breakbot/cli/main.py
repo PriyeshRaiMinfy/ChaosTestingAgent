@@ -186,6 +186,11 @@ def scan(
         help="Scan every account in the AWS Organization. Requires credentials with "
              "organizations:ListAccounts (Management account or delegated admin).",
     ),
+    single: bool = typer.Option(
+        False,
+        "--single",
+        help="Force single-account scan even if an Organization is detected.",
+    ),
     account_ids: list[str] = typer.Option(
         None,
         "--account-id",
@@ -244,20 +249,24 @@ def scan(
         console.print(f"[red]Unknown domains: {invalid}[/red]")
         raise typer.Exit(1)
 
-    # Decide which accounts and regions to walk
-    # Auto-detect org if --org not explicitly passed
-    if not org:
+    # Mutual exclusion
+    if org and single:
+        console.print("[red]Cannot use both --org and --single[/red]")
+        raise typer.Exit(1)
+
+    # Auto-detect org if --org not explicitly passed (and not --single)
+    if not org and not single:
         from breakbot.org.discovery import EnvironmentDiscovery
         _disc = EnvironmentDiscovery(master, member_role_name=member_role)
-        _det = _disc._detect_org()
-        if _det[0] and len(_det[1]) > 1:
+        _disc_result = _disc.detect(check_assume=False)
+        if _disc_result.is_org and len(_disc_result.accounts) > 1:
+            org = True
             console.print(
-                f"\n[bold yellow]Organization detected:[/bold yellow] "
-                f"{len(_det[1])} active accounts found."
+                f"\n[bold yellow]Organization auto-detected:[/bold yellow] "
+                f"{len(_disc_result.accounts)} active accounts. Enabling org-wide scan."
             )
             console.print(
-                "[dim]Scanning current account only. "
-                "Use --org to scan all accounts, or run `breakbot discover` for details.[/dim]"
+                "[dim]Use --single to force single-account mode.[/dim]"
             )
 
     if org:
@@ -393,9 +402,10 @@ def scan(
             # Org mode: prefer S3 org trail if accessible, else per-account LookupEvents
             from breakbot.org.discovery import EnvironmentDiscovery
             disc = EnvironmentDiscovery(master, member_role_name=member_role)
-            org_trail = disc._find_org_trail()
+            disc_result = disc.detect(check_assume=False)
+            org_trail = disc_result.org_trail
 
-            if org_trail and org_trail.is_accessible:
+            if org_trail and org_trail.is_accessible and disc_result.org_id:
                 console.print(
                     f"  [green]Reading org trail from S3:[/green] {org_trail.s3_bucket_name}"
                 )
@@ -403,6 +413,7 @@ def scan(
                     session=master,
                     bucket=org_trail.s3_bucket_name,
                     prefix=org_trail.s3_key_prefix,
+                    org_id=disc_result.org_id,
                 )
                 trail_events = reader.read(
                     lookback_days=days,
@@ -411,7 +422,13 @@ def scan(
                 )
             else:
                 # Fallback: per-account LookupEvents
-                if org_trail:
+                if org_trail and org_trail.is_accessible and not disc_result.org_id:
+                    console.print(
+                        "  [yellow]Org trail S3 accessible but org_id unknown "
+                        "(DescribeOrganization denied). Falling back to per-account "
+                        "LookupEvents to avoid incorrect S3 key paths.[/yellow]"
+                    )
+                elif org_trail:
                     console.print(
                         f"  [yellow]Org trail S3 not accessible ({org_trail.access_error}). "
                         f"Falling back to per-account LookupEvents.[/yellow]"

@@ -190,6 +190,12 @@ class SecurityAnalyst:
         ) as stream:
             message = stream.get_final_message()
 
+        if message.stop_reason != "tool_use":
+            raise RuntimeError(
+                f"Expected stop_reason='tool_use', got '{message.stop_reason}'. "
+                f"Model may have hit max_tokens or encountered an error."
+            )
+
         tool_input = _extract_tool_input(message)
         return _build_report(tool_input)
 

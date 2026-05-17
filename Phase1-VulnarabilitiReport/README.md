@@ -50,21 +50,30 @@ Phase1-VulnarabilitiReport/
     │
     ├── <a href="src/breakbot/scanner/"><b>scanner/</b></a>         ← Phase 2 — AWS resource discovery  (<a href="src/breakbot/scanner/README.md">README</a>)
     │   ├── base.py              abstract base — multi-region orchestration
-    │   ├── compute.py           EC2 instances · Lambda functions
-    │   ├── networking.py        VPCs · subnets · security groups · ALBs
-    │   ├── data.py              S3 buckets · RDS instances
-    │   └── identity.py          IAM roles · users · policy documents
+    │   ├── compute.py           EC2 · Lambda
+    │   ├── networking.py        VPCs · subnets · SGs · ALBs · route tables · NACLs
+    │   ├── data.py              S3 · RDS · DynamoDB · ElastiCache
+    │   ├── identity.py          IAM roles · users · policy documents
+    │   ├── cloudtrail.py        CloudTrail behavioral events + OrgTrailS3Reader
+    │   └── (10 more domain scanners: eks, secrets, ecs, messaging, waf, ...)
+    │
+    ├── <a href="src/breakbot/org/"><b>org/</b></a>             ← Multi-account Organization support
+    │   ├── cross_account.py     CrossAccountSessionFactory · OrganizationScanner
+    │   └── discovery.py         EnvironmentDiscovery · auto-detect org/trail/roles
     │
     ├── <a href="src/breakbot/graph/"><b>graph/</b></a>           ← Phase 4 — dependency graph + serializer  (<a href="src/breakbot/graph/README.md">README</a>)
     │   ├── edges.py             EdgeType enum · INTERNET virtual node
-    │   ├── builder.py           GraphBuilder — infers 8 edge types from scan
-    │   ├── serializer.py        GraphSerializer — compact LLM-ready text
+    │   ├── builder.py           GraphBuilder — subnet topology · 15+ edge types
+    │   ├── serializer.py        GraphSerializer — entry/sink detection · path search
+    │   ├── trail_overlay.py     TrailOverlay — behavioral edges from CloudTrail
     │   └── visualize.py         pyvis HTML renderer
     │
-    ├── <a href="src/breakbot/brain/"><b>brain/</b></a>           ← Phase 5 — LLM reasoning  [TBD]
+    ├── <a href="src/breakbot/brain/"><b>brain/</b></a>           ← Phase 5 — LLM reasoning via Claude/Bedrock
+    │   ├── analyst.py           SecurityAnalyst — tool-use schema enforcement
+    │   └── report.py            AnalysisReport dataclass · Markdown/JSON output
     │
     └── <a href="src/breakbot/cli/"><b>cli/</b></a>             ← CLI entry points  (<a href="src/breakbot/cli/README.md">README</a>)
-        └── main.py              breakbot scan · breakbot graph · breakbot validate
+        └── main.py              scan · graph · report · discover · validate · posture
 </pre>
 
 ---
@@ -167,11 +176,11 @@ Phase1-VulnarabilitiReport/
 
 ```bash
 # 1. Install  (uv is faster; pip also works)
-uv pip install -e ".[dev]"
+uv pip install -e ".[dev,llm]"
 
-# 2. Create a read-only IAM user in AWS Console
-#    → Attach the AWS-managed ReadOnlyAccess policy
-#    → Generate Access Key ID + Secret Access Key
+# 2. Create a read-only IAM user/role in AWS Console
+#    → Attach: SecurityAudit + ReadOnlyAccess
+#    → For Bedrock LLM access: also add bedrock:InvokeModel permission
 
 # 3. Configure an AWS profile for BreakBot
 aws configure --profile breakbot
@@ -179,13 +188,19 @@ aws configure --profile breakbot
 # 4. Confirm the profile is actually read-only (runs a positive + negative test)
 breakbot validate --profile breakbot
 
-# 5. Scan a region
-breakbot scan --profile breakbot --region us-east-1
+# 5. Discover topology (auto-detects single vs org, trail access)
+breakbot discover --profile breakbot
 
-# 6. Build the dependency graph and get LLM-ready output
+# 6. Scan (auto-detects org if applicable)
+breakbot scan --profile breakbot --region us-east-1 --trail
+
+# 7. Build the dependency graph and get LLM-ready output
 breakbot graph scans/scan-YYYYMMDD-HHMMSS-xxxxxx \
     --html    graph.html         \
     --serialize attack_surface.txt
+
+# 8. Generate attack-path report via Claude (uses AWS Bedrock by default)
+breakbot report scans/scan-YYYYMMDD-HHMMSS-xxxxxx
 ```
 
 ---
@@ -193,11 +208,26 @@ breakbot graph scans/scan-YYYYMMDD-HHMMSS-xxxxxx \
 ## CLI Reference
 
 ```
-breakbot scan       Run a read-only scan of the AWS account
-  --profile   -p    AWS profile name           (default: "default")
+breakbot discover   Auto-detect topology: single vs org, trail access, role availability
+  --profile   -p    AWS profile name
+  --region    -r    Region                     (default: us-east-1)
+  --member-role     Role name in member accounts (default: BreakBotReadOnly)
+  --output    -o    Save CFN StackSet template to file
+  --verbose   -v    Debug-level logging
+
+breakbot scan       Run a read-only scan (auto-detects org mode)
+  --profile   -p    AWS profile name
   --region    -r    Primary region             (default: us-east-1)
   --all-regions     Scan every enabled region in the account
-  --domain    -d    Restrict scan: compute | networking | data | identity
+  --org             Force org-wide scan
+  --single          Force single-account scan (skip auto-detect)
+  --account-id      Repeatable. In org mode, scan only these accounts
+  --member-role     Role to assume in member accounts
+  --domain    -d    Restrict scan domains (compute, networking, data, identity,
+                    eks, secrets, containers, messaging, waf, dns, cognito,
+                    apigateway, cdn, serverless)
+  --trail           Fetch CloudTrail behavioral events (management events, free)
+  --trail-days      Lookback period (default: 90, max: 90)
   --output    -o    Output directory           (default: ./scans)
   --verbose   -v    Debug-level logging
 
@@ -208,9 +238,25 @@ breakbot graph      Build dependency graph from a completed scan
   --max-hops        Max path length for entry→sink BFS  (default: 5)
   --verbose   -v    Debug-level logging
 
+breakbot report     Generate LLM-powered attack-path report
+  SCAN_DIR          Path to scan output directory  (required)
+  --format    -f    Output format: md, json, html  (default: md)
+  --region    -r    AWS region for Bedrock     (default: ap-south-1)
+  --bedrock/--no-bedrock  Use Bedrock (default) or direct Anthropic API
+  --token-budget    Cap tokens sent to Claude  (0 = no cap)
+  --output    -o    Output file path
+  --verbose   -v    Debug-level logging
+
 breakbot validate   Verify credentials are read-only before scanning
   --profile   -p    AWS profile name
   --region    -r    Region to test
+  --org             Validate every account in the org
+
+breakbot posture    Re-run posture analysis on a completed scan (no AWS calls)
+  SCAN_DIR          Path to scan output directory  (required)
+  --severity  -s    Filter by minimum severity
+  --category  -c    Filter by category
+  --output    -o    Output file
 ```
 
 Full command docs: [cli/README.md →](src/breakbot/cli/README.md)
@@ -237,7 +283,7 @@ Full command docs: [cli/README.md →](src/breakbot/cli/README.md)
 | Data validation | `pydantic` v2 |
 | Graph | `networkx.MultiDiGraph` |
 | CLI | `typer` + `rich` |
-| LLM | Anthropic Claude API — `claude-sonnet-4-6` / `opus-4-7` |
+| LLM | Claude via AWS Bedrock (default) or direct Anthropic API |
 | Visualization | `pyvis` (vis.js wrapper) |
 | Testing | `pytest` + `moto` (AWS service mocking) |
 | Packaging | `uv` / `pip`, `pyproject.toml` |
@@ -247,12 +293,13 @@ Full command docs: [cli/README.md →](src/breakbot/cli/README.md)
 ## Status
 
 - [x] Phase 1 — IAM read-only access + credential validation
-- [x] Phase 2 — Scanners: compute, networking, data, identity
-- [ ] Phase 3 — Observability: CloudTrail, VPC Flow Logs, X-Ray
+- [x] Phase 2 — Scanners: compute, networking, data, identity, eks, secrets,
+      containers, messaging, waf, dns, cognito, apigateway, cdn, serverless
+- [x] Phase 3 — CloudTrail behavioral events (management plane, free tier)
 - [x] Phase 4 — Dependency graph builder + serializer + visualizer
-- [ ] Phase 5 — LLM brain: attack path reasoning via Claude API
+- [x] Phase 5 — LLM brain: attack path reasoning via Claude (Bedrock)
+- [x] Phase 7 — Parallel scanning, org auto-detection, subnet topology validation
 - [ ] Phase 6 — Interfaces: FastAPI backend, React dashboard, MCP server
-- [ ] Phase 7 — Testing & hardening: cost controls, LLM output validation
 
 ---
 
