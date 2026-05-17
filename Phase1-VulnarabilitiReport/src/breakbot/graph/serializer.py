@@ -285,6 +285,18 @@ class GraphSerializer:
             elif t == ResourceType.SSM_PARAMETER.value:
                 sinks.add(node_id)
 
+            elif t == ResourceType.SECRETS_MANAGER_SECRET.value:
+                sinks.add(node_id)
+
+            elif t == ResourceType.DYNAMODB_TABLE.value:
+                sinks.add(node_id)
+
+            elif t == ResourceType.KMS_KEY.value:
+                sinks.add(node_id)
+
+            elif t == ResourceType.SSM_PARAMETER.value:
+                sinks.add(node_id)
+
         return sinks
 
     # ──────────────────────────── Writers ─────────────────────────────────

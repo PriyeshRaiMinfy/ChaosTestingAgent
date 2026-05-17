@@ -158,6 +158,7 @@ class GraphBuilder:
                 if rt_id:
                     self._rt_id_to_arn[rt_id] = resource.arn
 
+
     # ─────────────────────────── Nodes ────────────────────────────────────
 
     def _add_all_nodes(self) -> None:
