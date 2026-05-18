@@ -28,34 +28,31 @@ _DIRECT_MODEL = "claude-sonnet-4-6-20250514"
 _TOOL_NAME = "record_security_analysis"
 
 _SYSTEM_PROMPT = """\
-You are a senior cloud security analyst specializing in AWS attack path analysis.
+You are a penetration tester writing a findings report after scanning a live AWS environment.
+You have the resource graph and misconfiguration list. Write like you actually looked at this infrastructure — direct, specific, no filler.
 
-You will be given:
-1. A serialized AWS dependency graph showing resources, their relationships, and network exposure
-2. A list of posture findings (misconfigurations detected across the infrastructure)
+Rules:
+- Name the actual resources. Don't say "an S3 bucket" when you know it's "mahaveer0602".
+- Attack steps should read like a real procedure: what you'd type, what you'd click, what you'd get.
+- Blast radius: be concrete. "Access to all DynamoDB tables including patient-records and audit-logs" beats "data exfiltration risk".
+- Remediation: one specific action per item. Not "follow best practices" — the exact fix.
+- scan_summary: 2-3 sentences. What's the worst thing in this environment and why.
+- top_risks: plain bullets, no corporate language. What would you tell the dev team in a standup?
+- Skip paths that don't actually lead anywhere. If a public bucket has nothing sensitive, don't hype it.
+- ACTUALLY_ASSUMED / ACTUALLY_ACCESSED edges in the graph = this path was already traversed. Flag those.
 
-Your task is to reason about real, exploitable attack paths an adversary could follow to move
-from an internet-facing entry point to a high-value target (data stores, admin IAM roles, secrets).
+Severity:
+  CRITICAL = exploitable right now, no assumptions needed
+  HIGH     = one small step away from exploitable
+  MEDIUM   = needs extra conditions
+  LOW      = hygiene gap, low real-world impact
 
-## Analysis guidelines
-- Focus on paths that chain multiple vulnerabilities together (lateral movement, privilege escalation)
-- A path is only as strong as its weakest link — call out the single fix that breaks each chain
-- Consider both static graph paths (network + IAM) and behavioral evidence
-  (ACTUALLY_ASSUMED / ACTUALLY_ACCESSED edges = paths that have already been traversed)
-- Severity:
-    CRITICAL = active exploitation likely
-    HIGH     = clear exploitable path exists
-    MEDIUM   = requires additional conditions
-    LOW      = defense-in-depth gap only
-- Confidence:
-    HIGH   = direct path, clear evidence
-    MEDIUM = path exists but requires assumptions
-    LOW    = speculative
+Confidence:
+  HIGH   = direct evidence in graph
+  MEDIUM = reasonable assumption
+  LOW    = speculative
 
-## Output
-Call the `record_security_analysis` tool exactly once with your findings.
-Order attack_paths by severity (CRITICAL first). Include at most 10 paths.
-Quality over quantity.
+Call record_security_analysis once. Max 10 paths, best ones only.
 """
 
 _SEVERITY_ENUM = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
@@ -64,15 +61,15 @@ _CONFIDENCE_ENUM = ["HIGH", "MEDIUM", "LOW"]
 _ANALYSIS_TOOL: dict = {
     "name": _TOOL_NAME,
     "description": (
-        "Record the structured security analysis report. Call this exactly once "
-        "with the complete analysis. Do not include prose outside the tool call."
+        "Record the security findings. Be specific — use actual resource names from the graph. "
+        "Write like a pentester, not a compliance report. Call exactly once."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "scan_summary": {
                 "type": "string",
-                "description": "2-3 sentence overview of the attack surface.",
+                "description": "2-3 sentences. State the worst issue and why it matters. Name actual resources. No fluff.",
             },
             "overall_severity": {
                 "type": "string",
@@ -94,11 +91,11 @@ _ANALYSIS_TOOL: dict = {
                             "type": "array",
                             "minItems": 1,
                             "items": {"type": "string"},
-                            "description": "Ordered list of steps the attacker takes.",
+                            "description": "Ordered steps. Concrete actions: curl commands, aws cli calls, what you'd actually do. Name the real resources.",
                         },
                         "blast_radius": {
                             "type": "string",
-                            "description": "What data or systems are at risk if exploited.",
+                            "description": "What specifically breaks. Name the tables, buckets, roles at risk. One sentence.",
                         },
                         "severity": {"type": "string", "enum": _SEVERITY_ENUM},
                         "confidence": {"type": "string", "enum": _CONFIDENCE_ENUM},
@@ -106,7 +103,7 @@ _ANALYSIS_TOOL: dict = {
                             "type": "array",
                             "minItems": 1,
                             "items": {"type": "string"},
-                            "description": "Specific fixes that would break this chain.",
+                            "description": "Exact fixes. Not 'improve IAM policies' — the specific action: which role, which permission to remove, which setting to toggle.",
                         },
                     },
                     "required": [

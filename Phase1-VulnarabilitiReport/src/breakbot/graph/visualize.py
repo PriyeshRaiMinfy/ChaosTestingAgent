@@ -129,6 +129,7 @@ def render_html(graph: nx.MultiDiGraph, output_path: Path) -> None:
             title=_build_edge_tooltip(attrs),
         )
 
+    output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     net.write_html(str(output_path))
     logger.info("Graph visualization written to %s", output_path)
