@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -43,7 +44,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SCANS_DIR = Path(__file__).resolve().parents[2] / "scans"
+SCANS_DIR = Path(os.environ.get("SCANS_DIR", str(Path(__file__).resolve().parents[2] / "scans")))
 
 # In-memory scan state (PoC — no database)
 _active_scans: dict[str, dict[str, Any]] = {}
