@@ -37,9 +37,9 @@ logger = logging.getLogger(__name__)
 # when AWS pushes back. 10 attempts is generous but scanners are read-only
 # so it's safe.
 _BOTO_CONFIG = Config(
-    retries={"max_attempts": 10, "mode": "adaptive"},
-    connect_timeout=10,
-    read_timeout=30,
+    retries={"max_attempts": 3, "mode": "adaptive"},
+    connect_timeout=5,
+    read_timeout=15,
 )
 
 # Assumed-role sessions live for at most 1 hour by default. Most scans
