@@ -1,5 +1,6 @@
 services:
   backend:
+    image: ghcr.io/priyeshraiminfy/breakbot-api:latest
     build:
       context: ./Phase1-VulnarabilitiReport
       dockerfile: web/api/Dockerfile
@@ -7,20 +8,18 @@ services:
     environment:
       - SCANS_DIR=/app/scans
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-ap-south-1}
-      # Pass through host AWS credentials if using profile/env-based auth
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
       - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
     volumes:
-      # Persist scan output across restarts
       - breakbot-scans:/app/scans
-      # Optional: mount host ~/.aws for profile-based auth
       - ${HOME}/.aws:/root/.aws:ro
     ports:
       - "8000:8000"
     restart: unless-stopped
 
   frontend:
+    image: ghcr.io/priyeshraiminfy/breakbot-ui:latest
     build:
       context: ./Phase1-VulnarabilitiReport/web/frontend
       dockerfile: Dockerfile

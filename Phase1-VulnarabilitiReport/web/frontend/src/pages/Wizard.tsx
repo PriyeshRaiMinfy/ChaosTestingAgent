@@ -738,11 +738,3 @@ function StepGuide({ num, text }: { num: string; text: string }) {
   )
 }
 
-function DetRow({ label, value, mono }: { label: string; value: string; mono?: boolean; highlight?: string }) {
-  return (
-    <div className="flex items-start justify-between gap-4 border-t border-[#1e1e2e] pt-3 first:border-0 first:pt-0">
-      <span className="text-sm text-[#555] shrink-0">{label}</span>
-      <span className={`text-sm text-[#ccc] text-right ${mono ? 'font-mono' : ''}`}>{value}</span>
-    </div>
-  )
-}
