@@ -179,7 +179,7 @@ export default function Results() {
             <p className="text-sm text-slate-400 mt-1 font-mono">{scanId}</p>
           </div>
           <button onClick={() => navigate(`/graph/${scanId}`)}
-            className="px-5 py-2 bg-[#2563eb] text-white font-semibold text-sm rounded hover:bg-[#1d4ed8] transition">
+            className="px-5 py-2 bg-[#4f46e5] text-white font-semibold text-sm rounded hover:bg-[#4338ca] transition">
             View Graph
           </button>
         </div>
@@ -220,7 +220,7 @@ export default function Results() {
           {(['summary', 'report', 'posture'] as const).map(tab => (
             <button key={tab} onClick={() => handleTabChange(tab)}
               className={`px-5 py-3 text-sm font-medium border-b-2 transition capitalize ${
-                activeTab === tab ? 'border-[#3b82f6] text-[#60a5fa]' : 'border-transparent text-[#555] hover:text-[#999]'}`}>
+                activeTab === tab ? 'border-[#818cf8] text-[#818cf8]' : 'border-transparent text-[#555] hover:text-[#999]'}`}>
               {tab === 'report' ? 'Attack Paths' : tab === 'posture' ? 'Posture Findings' : 'Scan Details'}
             </button>
           ))}
