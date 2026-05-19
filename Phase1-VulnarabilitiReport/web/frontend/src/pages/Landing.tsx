@@ -19,8 +19,12 @@ export default function Landing() {
       </header>
 
       {/* Hero — left-aligned */}
-      <section className="px-10 pt-20 pb-14">
-        <div className="max-w-4xl">
+      <section
+        className="px-10 pt-20 pb-14 relative bg-cover bg-center bg-no-repeat"
+        style={{ backgroundImage: "url('/hero-bg.jpg')" }}
+      >
+        <div className="absolute inset-0 bg-[#111111]/75" />
+        <div className="relative max-w-4xl">
           <div className="inline-flex items-center gap-2 px-2.5 py-1 bg-[#1e1b4b]/60 border border-[#3730a3]/30 rounded text-xs text-[#818cf8] mb-6">
             <span className="w-1.5 h-1.5 rounded-full bg-[#818cf8]" />
             Automated AWS Vulnerability Testing

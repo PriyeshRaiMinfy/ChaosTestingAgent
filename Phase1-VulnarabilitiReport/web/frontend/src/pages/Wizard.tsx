@@ -415,10 +415,10 @@ export default function Wizard() {
           {/* Auth tabs */}
           <div className="border-b border-[#222] mb-6">
             <div className="flex">
-              <button onClick={() => setAuthMode('keys')} className={`px-4 py-2.5 text-sm border-b-2 transition ${authMode === 'keys' ? 'border-[#3b82f6] text-[#60a5fa]' : 'border-transparent text-[#555] hover:text-[#999]'}`}>
+              <button onClick={() => setAuthMode('keys')} className={`px-4 py-2.5 text-sm border-b-2 transition ${authMode === 'keys' ? 'border-[#818cf8] text-[#818cf8]' : 'border-transparent text-[#555] hover:text-[#999]'}`}>
                 Direct Access Keys
               </button>
-              <button onClick={() => setAuthMode('profile')} className={`px-4 py-2.5 text-sm border-b-2 transition ${authMode === 'profile' ? 'border-[#3b82f6] text-[#60a5fa]' : 'border-transparent text-[#555] hover:text-[#999]'}`}>
+              <button onClick={() => setAuthMode('profile')} className={`px-4 py-2.5 text-sm border-b-2 transition ${authMode === 'profile' ? 'border-[#818cf8] text-[#818cf8]' : 'border-transparent text-[#555] hover:text-[#999]'}`}>
                 Local Dev Session (boto3 Profile)
               </button>
             </div>
@@ -460,7 +460,7 @@ export default function Wizard() {
           <div className="flex items-center justify-between mb-8">
             <a href="/" className="text-sm text-[#555] hover:text-[#999] transition">← Cancel</a>
             <button onClick={handleConnect} disabled={validating || connectionVerified}
-              className="px-5 py-2.5 bg-[#2563eb] text-white text-sm font-semibold rounded hover:bg-[#1d4ed8] transition disabled:opacity-40 disabled:cursor-not-allowed">
+              className="px-5 py-2.5 bg-[#4f46e5] text-white text-sm font-semibold rounded hover:bg-[#4338ca] transition disabled:opacity-40 disabled:cursor-not-allowed">
               {validating ? 'Connecting...' : connectionVerified ? 'Connected' : 'Connect to AWS Session'}
             </button>
           </div>
@@ -482,7 +482,7 @@ export default function Wizard() {
                 <div className="px-4 py-3 border-t border-[#166534]/30 bg-[#14532d]/20 flex items-center justify-between">
                   <span className="text-sm text-[#4ade80]">Connection verified — account {discovery?.account_id}</span>
                   <button onClick={() => setStep('verify')}
-                    className="px-4 py-2 bg-[#2563eb] text-white text-xs font-semibold rounded hover:bg-[#1d4ed8] transition">
+                    className="px-4 py-2 bg-[#4f46e5] text-white text-xs font-semibold rounded hover:bg-[#4338ca] transition">
                     Configure Scopes
                   </button>
                 </div>
@@ -533,7 +533,7 @@ export default function Wizard() {
           <div className="flex items-center justify-between">
             <button onClick={() => setStep('connect')} className="text-sm text-[#555] hover:text-[#999] transition">← Back</button>
             <button onClick={() => setStep('configure')}
-              className="px-5 py-2.5 bg-[#2563eb] text-white text-sm font-semibold rounded hover:bg-[#1d4ed8] transition">
+              className="px-5 py-2.5 bg-[#4f46e5] text-white text-sm font-semibold rounded hover:bg-[#4338ca] transition">
               Configure Scan
             </button>
           </div>
@@ -586,7 +586,7 @@ export default function Wizard() {
                           <span className={`text-sm font-mono shrink-0 w-36 ${selected ? 'text-white' : 'text-[#aaa]'}`}>{r.code}</span>
                           <span className="text-xs text-[#555] truncate">{r.name}</span>
                         </div>
-                        <div className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 ml-4 transition ${selected ? 'bg-[#2563eb] border-[#2563eb]' : 'border-[#333]'}`}>
+                        <div className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 ml-4 transition ${selected ? 'bg-[#4f46e5] border-[#4f46e5]' : 'border-[#333]'}`}>
                           {selected && <span className="text-white text-[10px] font-black">✓</span>}
                         </div>
                       </button>
@@ -623,7 +623,7 @@ export default function Wizard() {
                 <div className="flex gap-2">
                   {(['fast', 'deep', 'custom'] as const).map((m) => (
                     <button key={m} onClick={() => setTrailMode(m)}
-                      className={`px-3 py-1.5 text-xs rounded transition ${trailMode === m ? 'bg-[#1e3a5f] border border-[#3b82f6]/50 text-[#93c5fd]' : 'border border-[#1e1e2e] text-[#555] hover:text-[#999]'}`}>
+                      className={`px-3 py-1.5 text-xs rounded transition ${trailMode === m ? 'bg-[#1e1b4b] border border-[#818cf8]/50 text-[#a5b4fc]' : 'border border-[#1e1e2e] text-[#555] hover:text-[#999]'}`}>
                       {m === 'fast' ? 'Fast — 14d / 20pg' : m === 'deep' ? 'Deep — 90d / 100pg' : 'Custom'}
                     </button>
                   ))}
@@ -649,7 +649,7 @@ export default function Wizard() {
           <div className="flex items-center justify-between">
             <button onClick={() => setStep('verify')} className="text-sm text-[#555] hover:text-[#999] transition">← Back</button>
             <button onClick={handleStartScan}
-              className="px-5 py-2.5 bg-[#2563eb] text-white text-sm font-semibold rounded hover:bg-[#1d4ed8] transition">
+              className="px-5 py-2.5 bg-[#4f46e5] text-white text-sm font-semibold rounded hover:bg-[#4338ca] transition">
               Execute Scan
             </button>
           </div>
@@ -668,7 +668,7 @@ export default function Wizard() {
             <span className="text-xs font-mono text-[#aaa]">{progress}%</span>
           </div>
           <div className="w-full h-1 bg-[#1c1c1c] rounded-full overflow-hidden mb-8">
-            <div className="h-full bg-[#3b82f6] rounded-full transition-all duration-500" style={{ width: `${progress}%` }} />
+            <div className="h-full bg-[#4f46e5] rounded-full transition-all duration-500" style={{ width: `${progress}%` }} />
           </div>
 
           <div className="border border-[#1e1e2e] bg-[#0e0e16] rounded p-5 mb-5">
@@ -714,7 +714,7 @@ export default function Wizard() {
           {progress === 100 && scanId && (
             <div className="flex gap-3">
               <button onClick={() => navigate(`/results/${scanId}`)}
-                className="px-5 py-2.5 bg-[#2563eb] text-white text-sm font-semibold rounded hover:bg-[#1d4ed8] transition">
+                className="px-5 py-2.5 bg-[#4f46e5] text-white text-sm font-semibold rounded hover:bg-[#4338ca] transition">
                 View Report
               </button>
               <button onClick={() => navigate(`/graph/${scanId}`)}
