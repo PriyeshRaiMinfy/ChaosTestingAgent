@@ -1,0 +1,35 @@
+name: Phase1.5 - Validate & Test
+
+on:
+  push:
+    paths:
+      - "Phase1.5-ComplianceAuditVault/**"
+  pull_request:
+    paths:
+      - "Phase1.5-ComplianceAuditVault/**"
+
+defaults:
+  run:
+    working-directory: Phase1.5-ComplianceAuditVault
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Unit tests
+        run: pytest tests/unit/ -v --tb=short
+
+      - name: CDK synth (no AWS needed)
+        run: npx aws-cdk synth VaultAccountStack -c env=dev --quiet
