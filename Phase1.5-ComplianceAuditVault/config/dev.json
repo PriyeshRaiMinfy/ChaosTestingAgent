@@ -1,0 +1,12 @@
+{
+  "environment": "dev",
+  "account_id": "",
+  "region": "ap-south-1",
+  "retention_days": 1,
+  "bucket_name_prefix": "audit-vault-dev",
+  "enable_access_logging": false,
+  "glacier_transition_days": 90,
+  "bedrock_model_id": "apac.anthropic.claude-sonnet-4-20250514-v1:0",
+  "detection_schedule_rate_minutes": 60,
+  "notification_email": ""
+}

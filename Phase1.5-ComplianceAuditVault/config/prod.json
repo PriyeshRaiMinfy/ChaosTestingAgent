@@ -1,0 +1,12 @@
+{
+  "environment": "prod",
+  "account_id": "",
+  "region": "ap-south-1",
+  "retention_days": 2555,
+  "bucket_name_prefix": "security-lake-vault",
+  "enable_access_logging": true,
+  "glacier_transition_days": 90,
+  "bedrock_model_id": "apac.anthropic.claude-sonnet-4-20250514-v1:0",
+  "detection_schedule_rate_minutes": 5,
+  "notification_email": ""
+}
